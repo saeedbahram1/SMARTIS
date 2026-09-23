@@ -2,12 +2,10 @@ import 'dart:convert';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:record/record.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'services/backend_socket.dart';
-import 'services/wake_listener.dart';
+import 'services/google_voice_session.dart';
 import 'widgets/smartis_log_panel.dart';
 import 'widgets/smartis_orb.dart';
 
@@ -22,18 +20,17 @@ class _SmartisAppState extends State<SmartisApp> {
   static const Color gold = Color(0xFFFFD700);
 
   final BackendSocket backend = BackendSocket();
+  final GoogleVoiceSessionClient voiceClient = GoogleVoiceSessionClient();
   final AudioPlayer player = AudioPlayer();
-  late final WakeListener wakeListener;
 
   SmartisVisualState visualState = SmartisVisualState.idle;
   double audioLevel = 0.0;
 
-  String status = 'در حال اتصال...';
+  String status = 'در حال اتصال به سرور...';
   String transcript = 'بگو «اسمارتیز»';
-  String detectedLanguage = '';
-  String mode = '...';
+  String detectedLanguage = 'fa';
+  String mode = 'ONLINE';
 
-  bool recording = false;
   bool processing = false;
   bool shuttingDown = false;
 
@@ -43,21 +40,16 @@ class _SmartisAppState extends State<SmartisApp> {
   void initState() {
     super.initState();
 
-    wakeListener = WakeListener(backend);
-
+    // 1. Connect to general backend WebSocket for health & agent execution
     backend.connect(
       onMessage: (message) {
         if (!mounted) return;
         if (message['type'] == 'backend_ready') {
           final online = message['internet'] == true;
-          final googleStt = message['online_stt_ready'] == true;
           setState(() {
             mode = online ? 'ONLINE' : 'OFFLINE';
-            status = online
-                ? 'آنلاین — آماده شنیدن «اسمارتیز»'
-                : 'آفلاین — آماده شنیدن «اسمارتیز»';
           });
-          _log('Backend ready • internet=$online • google_stt=$googleStt');
+          _log('Backend connected • internet=$online • provider=google_stt');
         }
       },
       onError: (error) {
@@ -68,10 +60,119 @@ class _SmartisAppState extends State<SmartisApp> {
       },
     );
 
-    Future<void>.delayed(
-      const Duration(milliseconds: 700),
-      _armWake,
+    // 2. Connect to dedicated /voice WebSocket managing PyAudio & Google STT
+    _initVoiceSession();
+  }
+
+  void _initVoiceSession() {
+    voiceClient.connect(
+      onEvent: _onVoiceEvent,
+      onError: (err) {
+        _log('Voice connection error: $err');
+        if (mounted) {
+          setState(() => status = 'خطا در اتصال صوتی');
+        }
+        // Attempt reconnect after brief delay
+        Future.delayed(const Duration(seconds: 3), () {
+          if (mounted && !shuttingDown && !voiceClient.isConnected) {
+            _initVoiceSession();
+          }
+        });
+      },
+      onDone: () {
+        _log('Voice session closed');
+      },
     );
+  }
+
+  void _onVoiceEvent(Map<String, dynamic> event) {
+    if (!mounted || shuttingDown) return;
+    final type = event['type']?.toString();
+
+    switch (type) {
+      case 'voice_ready':
+        _log('Microphone initialized');
+        final currentMode = event['mode']?.toString() ?? 'wake';
+        if (currentMode == 'wake') {
+          _log('Listening for wake word');
+          setState(() {
+            visualState = SmartisVisualState.listening;
+            status = 'در حال شنیدن... بگو «اسمارتیز»';
+          });
+        }
+        break;
+
+      case 'calibrating':
+        final dur = event['duration'] ?? 0.7;
+        _log('Calibration complete ($dur s)');
+        setState(() => status = 'کالیبراسیون صدای محیط...');
+        break;
+
+      case 'listening':
+        final currentMode = event['mode']?.toString() ?? 'wake';
+        if (currentMode == 'wake') {
+          _log('Listening for wake word');
+          setState(() {
+            visualState = SmartisVisualState.listening;
+            status = 'در حال شنیدن... بگو «اسمارتیز»';
+            transcript = 'بگو «اسمارتیز»';
+          });
+        } else if (currentMode == 'command') {
+          _log('Listening for command');
+          setState(() {
+            visualState = SmartisVisualState.listening;
+            status = 'گوش می‌دهم... دستور خود را بگویید';
+            transcript = 'صحبت کن...';
+          });
+        }
+        break;
+
+      case 'speech_captured':
+        setState(() {
+          visualState = SmartisVisualState.thinking;
+          status = 'در حال پردازش گفتار...';
+        });
+        break;
+
+      case 'transcript':
+        final text = event['text']?.toString() ?? '';
+        final prov = event['provider']?.toString() ?? 'google';
+        if (text.isNotEmpty) {
+          _log('STT captured: "$text" ($prov)');
+        }
+        break;
+
+      case 'wake_detected':
+        _onWakeDetected(event);
+        break;
+
+      case 'command_final':
+        _onCommandFinal(event);
+        break;
+
+      case 'recognition_error':
+        final err = event['error']?.toString() ?? '';
+        _log('Recognition notice: $err');
+        // If command timed out or had error, cycle back to wake
+        if (!processing) {
+          Future.delayed(const Duration(milliseconds: 500), () {
+            if (mounted && !shuttingDown) _startWakeListening();
+          });
+        }
+        break;
+
+      case 'voice_error':
+        _log('Voice error: ${event['error']}');
+        break;
+
+      case 'voice_fatal':
+        _log('Voice fatal: ${event['error']}');
+        setState(() => status = 'میکروفون در دسترس نیست');
+        break;
+
+      case 'voice_stopped':
+        break;
+    }
   }
 
   void _log(String message) {
@@ -81,252 +182,97 @@ class _SmartisAppState extends State<SmartisApp> {
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
     setState(() {
       logs.add('[$stamp] $message');
-      if (logs.length > 120) {
-        logs.removeRange(0, logs.length - 120);
+      if (logs.length > 150) {
+        logs.removeRange(0, logs.length - 150);
       }
     });
   }
 
-  Future<void> _armWake() async {
-    if (!mounted || shuttingDown || processing || recording) return;
-
-    setState(() {
-      visualState = SmartisVisualState.listening;
-      audioLevel = 0.0;
-    });
-    _log('Wake listener armed');
-
-    await wakeListener.start(
-      onStatus: (message) {
-        if (!mounted) return;
-        setState(() {
-          status = message;
-          visualState = SmartisVisualState.listening;
-        });
-      },
-      onLevel: (level) {
-        if (!mounted) return;
-        setState(() => audioLevel = level);
-      },
-      onWake: _onWake,
-    );
+  void _startWakeListening() {
+    if (!mounted || shuttingDown || processing) return;
+    voiceClient.startWake(language: detectedLanguage);
   }
 
-  Future<void> _onWake(Map<String, dynamic> result) async {
-    if (!mounted) return;
+  Future<void> _onWakeDetected(Map<String, dynamic> event) async {
+    if (!mounted || shuttingDown || processing) return;
 
-    await wakeListener.stop();
-
-    final language = (result['language'] ?? 'fa').toString();
+    _log('Wake detected');
+    final language = (event['language'] ?? 'fa').toString();
     detectedLanguage = language;
     final reply = language == 'fa' ? 'جانم' : "Yes, I'm listening.";
 
     setState(() {
       visualState = SmartisVisualState.speaking;
       status = reply;
-      transcript = (result['text'] ?? '').toString();
-      if (transcript.isEmpty) transcript = 'Smartis';
-      mode = result['offline'] == true ? 'OFFLINE' : 'ONLINE';
+      transcript = (event['text'] ?? 'اسمارتیز').toString();
+      mode = event['offline'] == true ? 'OFFLINE' : 'ONLINE';
     });
 
-    _log(
-      'Wake detected • lang=$language • mode=$mode • provider=${result['provider'] ?? 'unknown'}',
-    );
-
+    _log('TTS: $reply');
     await _speak(reply, language);
 
-    if (!mounted) return;
+    if (!mounted || shuttingDown) return;
 
-    await Future<void>.delayed(
-      const Duration(milliseconds: 220),
-    );
+    // Small delay to clear speaker audio before microphone opens for command
+    await Future.delayed(const Duration(milliseconds: 280));
 
-    if (!mounted) return;
+    if (!mounted || shuttingDown) return;
 
-    // Command capture always records a short WAV clip and sends it to the
-    // backend's /transcribe endpoint, which itself tries Google's Web Speech
-    // API (via SpeechRecognition) first when online and automatically falls
-    // back to the local offline Whisper model otherwise. This single path
-    // replaces the old Deepgram-only live-streaming route.
-    await _recordCommand();
+    // Start command session on backend PyAudio
+    _log('Listening for command');
+    voiceClient.startCommand(language: detectedLanguage);
   }
 
-  Future<void> _recordCommand() async {
-    if (processing || recording || shuttingDown) return;
+  Future<void> _onCommandFinal(Map<String, dynamic> event) async {
+    if (!mounted || shuttingDown) return;
 
-    final AudioRecorder recorder = wakeListener.recorderA;
+    final commandText = (event['text'] ?? '').toString().trim();
+    final language = (event['language'] ?? detectedLanguage).toString();
+    final isOffline = event['offline'] == true;
 
-    if (!await recorder.hasPermission()) {
-      if (mounted) {
-        setState(() => status = 'اجازه دسترسی به میکروفون داده نشده');
-      }
-      return;
-    }
-
-    final dir = await getTemporaryDirectory();
-    final path =
-        '${dir.path}\\smartis_command_${DateTime.now().millisecondsSinceEpoch}.wav';
-
-    try {
-      // Same reasoning as the wake listener: no forced sampleRate/channels,
-      // and Windows' DSP chain (autoGain/echoCancel/noiseSuppress) disabled —
-      // both were candidates for silently muting audio after the first
-      // buffer. faster-whisper on the backend handles whatever format the
-      // device natively records in.
-      await recorder.start(
-        const RecordConfig(
-          encoder: AudioEncoder.wav,
-          autoGain: false,
-          echoCancel: false,
-          noiseSuppress: false,
-        ),
-        path: path,
-      );
-
-      setState(() {
-        recording = true;
-        visualState = SmartisVisualState.listening;
-        audioLevel = 0.0;
-        status = 'گوش می‌دهم...';
-        transcript = 'صحبت کن...';
-      });
-
-      _log('Offline/file STT recording started');
-
-      DateTime? quietSince;
-      bool speechStarted = false;
-      final startedAt = DateTime.now();
-
-      while (mounted && recording) {
-        final amplitude = await recorder.getAmplitude();
-        final level =
-            ((amplitude.current + 60.0) / 60.0).clamp(0.0, 1.0).toDouble();
-
-        setState(() => audioLevel = level);
-
-        if (level >= 0.060) {
-          speechStarted = true;
-          quietSince = null;
-        } else if (speechStarted) {
-          quietSince ??= DateTime.now();
-        }
-
-        final elapsed = DateTime.now().difference(startedAt);
-        final quiet = quietSince == null
-            ? Duration.zero
-            : DateTime.now().difference(quietSince!);
-
-        if (speechStarted &&
-            elapsed > const Duration(milliseconds: 1800) &&
-            quiet > const Duration(milliseconds: 1900)) {
-          break;
-        }
-
-        if (elapsed > const Duration(seconds: 20)) break;
-
-        await Future<void>.delayed(
-          const Duration(milliseconds: 90),
-        );
-      }
-
-      final recorded = await recorder.stop();
-      _log('File audio captured; sending to STT');
-
-      setState(() {
-        recording = false;
-        processing = true;
-        visualState = SmartisVisualState.thinking;
-        status = 'در حال تبدیل صدا به متن...';
-        audioLevel = 0.0;
-      });
-
-      if (recorded == null) {
-        throw Exception('Audio file was not created');
-      }
-
-      final started = DateTime.now();
-      final result = await backend.transcribe(
-        recorded,
-        languageHint: detectedLanguage.isEmpty ? null : detectedLanguage,
-      );
-
-      _log(
-        'File STT finished in ${DateTime.now().difference(started).inMilliseconds}ms • provider=${result['provider'] ?? 'unknown'}',
-      );
-
-      if (!mounted) return;
-
-      if (result['ok'] == true) {
-        final text = (result['text'] ?? '').toString().trim();
-        final language =
-            (result['language'] ?? detectedLanguage).toString();
-
-        setState(() {
-          transcript = text.isEmpty ? 'صدایی تشخیص داده نشد' : text;
-          detectedLanguage = language;
-          mode = result['offline'] == true ? 'OFFLINE' : 'ONLINE';
-          status = result['offline'] == true
-              ? 'تشخیص آفلاین'
-              : 'تشخیص آنلاین';
-        });
-
-        if (text.isNotEmpty) {
-          await _runAgent(text, language);
-        }
-      } else {
-        setState(() {
-          status =
-              'خطا در تشخیص گفتار: ${result['error'] ?? 'نامشخص'}';
-        });
-      }
-    } catch (error) {
-      _log('File STT error • $error');
-      if (mounted) setState(() => status = 'خطا: $error');
-    } finally {
-      if (mounted) {
-        setState(() {
-          recording = false;
-          processing = false;
-          visualState = SmartisVisualState.idle;
-          audioLevel = 0.0;
-        });
-        Future<void>.delayed(
-          const Duration(milliseconds: 300),
-          () {
-            if (mounted && !shuttingDown) _armWake();
-          },
-        );
-      }
-    }
-  }
-
-  Future<void> _runAgent(
-    String text,
-    String language,
-  ) async {
-    if (!mounted) return;
+    _log('Google STT: $commandText');
 
     setState(() {
+      transcript = commandText.isEmpty ? 'دستوری دریافت نشد' : commandText;
+      detectedLanguage = language;
+      mode = isOffline ? 'OFFLINE' : 'ONLINE';
       visualState = SmartisVisualState.thinking;
-      status = 'در حال فکر کردن...';
+      status = 'در حال تحلیل دستور...';
     });
 
+    if (commandText.isNotEmpty) {
+      await _executeCommand(commandText, language);
+    } else {
+      _startWakeListening();
+    }
+  }
+
+  Future<void> _executeCommand(String text, String language) async {
+    if (processing) return;
+    processing = true;
+
+    final overallStart = DateTime.now();
+
     try {
-      _log('Agent plan started');
-      final started = DateTime.now();
+      // 1. Agent planning (Fast Path or LLM)
+      final planStart = DateTime.now();
       final response = await backend.plan(text, language);
-      _log(
-        'Agent plan finished in ${DateTime.now().difference(started).inMilliseconds}ms • provider=${response['provider'] ?? 'unknown'}',
-      );
+      final planTime = DateTime.now().difference(planStart).inMilliseconds;
 
       if (response['ok'] != true) {
-        setState(() => status = 'Agent خطا داد: ${response['error'] ?? ''}');
+        setState(() => status = 'خطا در برنامه‌ریزی: ${response['error'] ?? ''}');
+        _startWakeListening();
         return;
       }
 
-      final plan = Map<String, dynamic>.from(
-        response['plan'] ?? {},
-      );
+      final isFastPath = response['provider'] == 'fast-path';
+      if (isFastPath) {
+        _log('Fast Path matched');
+      } else {
+        _log('Agent planned in ${planTime}ms');
+      }
+
+      final plan = Map<String, dynamic>.from(response['plan'] ?? {});
 
       if (plan['needs_confirmation'] == true) {
         setState(() => status = 'این عملیات نیاز به تأیید دارد');
@@ -339,15 +285,26 @@ class _SmartisAppState extends State<SmartisApp> {
         return;
       }
 
-      _log('Tool execution started');
-      final executeStarted = DateTime.now();
+      // 2. Tool Execution
+      final toolStart = DateTime.now();
+      final actions = (plan['actions'] as List?) ?? [];
+      for (final act in actions) {
+        if (act is Map) {
+          final tool = act['tool']?.toString();
+          final args = act['args'];
+          if (tool == 'open_application') {
+            _log('Opening ${args?['app'] ?? 'application'}');
+          } else if (tool == 'open_website') {
+            _log('Opening website ${args?['url'] ?? ''}');
+          }
+        }
+      }
+
       final execution = await backend.execute(plan);
-      _log(
-        'Tool execution finished in ${DateTime.now().difference(executeStarted).inMilliseconds}ms',
-      );
+      final toolTime = DateTime.now().difference(toolStart).inMilliseconds;
 
       if (execution['needs_confirmation'] == true) {
-        setState(() => status = 'برای اجرای این عملیات تأیید لازم است');
+        setState(() => status = 'تأیید لازم است');
         await _speak(
           language == 'fa'
               ? 'برای این عملیات تأیید شما لازم است.'
@@ -357,31 +314,29 @@ class _SmartisAppState extends State<SmartisApp> {
         return;
       }
 
+      _log('Command complete');
+
+      // 3. TTS Response
       final reply = (plan['reply'] ?? '').toString();
+      final ttsStart = DateTime.now();
 
       if (execution['ok'] == true) {
         setState(() => status = 'انجام شد');
-
-        final results =
-            (execution['results'] as List?) ?? const [];
+        final results = (execution['results'] as List?) ?? const [];
         final spokenChunks = <String>[];
 
         for (final item in results) {
           if (item is Map) {
             final itemResult = item['result'];
             if (itemResult is Map) {
-              final spoken =
-                  (itemResult['speak'] ?? '').toString().trim();
+              final spoken = (itemResult['speak'] ?? '').toString().trim();
               if (spoken.isNotEmpty) spokenChunks.add(spoken);
             }
           }
         }
 
         if (spokenChunks.isNotEmpty) {
-          await _speak(
-            spokenChunks.join('. '),
-            language,
-          );
+          await _speak(spokenChunks.join('. '), language);
         } else if (reply.isNotEmpty) {
           await _speak(reply, language);
         }
@@ -394,16 +349,34 @@ class _SmartisAppState extends State<SmartisApp> {
           language,
         );
       }
+
+      final ttsTime = DateTime.now().difference(ttsStart).inMilliseconds;
+      final totalTime = DateTime.now().difference(overallStart).inMilliseconds;
+
+      _log(
+        'STT: Google | Agent: ${planTime}ms | Tool: ${toolTime}ms | TTS: ${ttsTime}ms | Total: ${totalTime}ms',
+      );
     } catch (error) {
-      _log('Agent error • $error');
-      if (mounted) setState(() => status = 'خطا در Agent: $error');
+      _log('Execution error: $error');
+      if (mounted) setState(() => status = 'خطا: $error');
+    } finally {
+      processing = false;
+      if (mounted && !shuttingDown) {
+        setState(() {
+          visualState = SmartisVisualState.idle;
+          audioLevel = 0.0;
+        });
+        // Loop back to wake listening smoothly
+        Future.delayed(const Duration(milliseconds: 350), () {
+          if (mounted && !shuttingDown) {
+            _startWakeListening();
+          }
+        });
+      }
     }
   }
 
-  Future<void> _speak(
-    String text,
-    String? language,
-  ) async {
+  Future<void> _speak(String text, String? language) async {
     if (!mounted) return;
 
     setState(() {
@@ -411,12 +384,7 @@ class _SmartisAppState extends State<SmartisApp> {
       audioLevel = 0.0;
     });
 
-    final started = DateTime.now();
     final result = await backend.speak(text, language);
-    _log(
-      'TTS finished in ${DateTime.now().difference(started).inMilliseconds}ms • provider=${result['provider'] ?? 'unknown'}',
-    );
-
     if (result['ok'] != true) {
       if (mounted) {
         setState(() => status = 'خطا در TTS: ${result['error'] ?? ''}');
@@ -438,7 +406,7 @@ class _SmartisAppState extends State<SmartisApp> {
   @override
   void dispose() {
     shuttingDown = true;
-    wakeListener.dispose();
+    voiceClient.dispose();
     player.dispose();
     backend.dispose();
     super.dispose();
@@ -449,7 +417,7 @@ class _SmartisAppState extends State<SmartisApp> {
       case SmartisVisualState.idle:
         return 'بگو «اسمارتیز»';
       case SmartisVisualState.listening:
-        return recording ? 'گوش می‌دهم...' : 'در حال شنیدن...';
+        return 'گوش می‌دهم...';
       case SmartisVisualState.thinking:
         return 'دارم فکر می‌کنم...';
       case SmartisVisualState.speaking:
@@ -468,127 +436,154 @@ class _SmartisAppState extends State<SmartisApp> {
           behavior: HitTestBehavior.translucent,
           onPanStart: (_) => windowManager.startDragging(),
           child: SafeArea(
-            child: Column(
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    IconButton(
-                      tooltip: 'بستن',
-                      onPressed: () => windowManager.close(),
-                      icon: const Icon(
-                        Icons.close_rounded,
-                        color: gold,
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // Responsively scale Orb so it never overflows 520x610 or any window size,
+                // keeping its majestic, full-sized presence intact.
+                final orbDimension =
+                    (constraints.maxHeight * 0.38).clamp(180.0, 280.0);
+
+                return SingleChildScrollView(
+                  physics: const BouncingScrollPhysics(),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      minHeight: constraints.maxHeight,
+                    ),
+                    child: IntrinsicHeight(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Top bar with close button
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              IconButton(
+                                tooltip: 'بستن',
+                                onPressed: () => windowManager.close(),
+                                icon: const Icon(
+                                  Icons.close_rounded,
+                                  color: gold,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                            ],
+                          ),
+
+                          // Smartis Orb (unmodified CustomPainter animation)
+                          Center(
+                            child: SizedBox(
+                              width: orbDimension,
+                              height: orbDimension,
+                              child: FittedBox(
+                                fit: BoxFit.contain,
+                                child: SmartisOrb(
+                                  state: visualState,
+                                  level: audioLevel,
+                                ),
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 6),
+                          const Text(
+                            'S M A R T I S',
+                            style: TextStyle(
+                              fontSize: 22,
+                              letterSpacing: 8,
+                              fontWeight: FontWeight.w600,
+                              color: gold,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _stateText(),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: gold,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 20),
+                            child: Text(
+                              status,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(.82),
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Text(
+                                'حالت: $mode',
+                                style: TextStyle(
+                                  color: gold.withOpacity(.76),
+                                  fontSize: 11,
+                                  letterSpacing: 1,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Text(
+                                detectedLanguage == 'fa' ? 'فارسی' : 'English',
+                                style: TextStyle(
+                                  color: gold.withOpacity(.9),
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+
+                          // Transcript box
+                          Container(
+                            margin: const EdgeInsets.symmetric(horizontal: 36),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 10,
+                            ),
+                            decoration: BoxDecoration(
+                              border: Border.all(
+                                color: gold.withOpacity(.24),
+                              ),
+                              borderRadius: BorderRadius.circular(16),
+                              color: Colors.black.withOpacity(.24),
+                            ),
+                            child: Text(
+                              transcript,
+                              textAlign: TextAlign.center,
+                              textDirection: TextDirection.rtl,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                          ),
+
+                          const SizedBox(height: 8),
+
+                          // Real-time Live Log panel
+                          SmartisLogPanel(entries: logs),
+
+                          const SizedBox(height: 6),
+                          Text(
+                            'Smartis • Google SpeechRecognition + PyAudio • Windows',
+                            style: TextStyle(
+                              fontSize: 9.5,
+                              color: gold.withOpacity(.58),
+                              letterSpacing: .5,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                        ],
                       ),
                     ),
-                    const SizedBox(width: 10),
-                  ],
-                ),
-                // The orb widget paints itself at a fixed 360x360 size, but
-                // the window can be resized down to its minimum (or the
-                // content below can grow, e.g. long transcripts). Wrapping
-                // it in Expanded+FittedBox lets it shrink to whatever space
-                // is actually left instead of forcing the Column to be
-                // taller than the window — which is what was causing the
-                // window to grow and the yellow/black "overflowed" warning
-                // bar to appear at the bottom.
-                Expanded(
-                  child: Center(
-                    child: FittedBox(
-                      fit: BoxFit.contain,
-                      child: SmartisOrb(
-                        state: visualState,
-                        level: audioLevel,
-                      ),
-                    ),
                   ),
-                ),
-                const Text(
-                  'S M A R T I S',
-                  style: TextStyle(
-                    fontSize: 25,
-                    letterSpacing: 8,
-                    fontWeight: FontWeight.w600,
-                    color: gold,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _stateText(),
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: gold,
-                  ),
-                ),
-                const SizedBox(height: 7),
-                Text(
-                  status,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(.8),
-                    fontSize: 13,
-                  ),
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  'حالت: $mode',
-                  style: TextStyle(
-                    color: gold.withOpacity(.76),
-                    fontSize: 11,
-                    letterSpacing: 1,
-                  ),
-                ),
-                if (detectedLanguage.isNotEmpty) ...[
-                  const SizedBox(height: 3),
-                  Text(
-                    detectedLanguage == 'fa'
-                        ? 'فارسی'
-                        : detectedLanguage == 'en'
-                            ? 'English'
-                            : detectedLanguage,
-                    style: const TextStyle(
-                      color: gold,
-                      fontSize: 11,
-                    ),
-                  ),
-                ],
-                const SizedBox(height: 12),
-                Container(
-                  margin: const EdgeInsets.symmetric(horizontal: 40),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 14,
-                  ),
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                      color: gold.withOpacity(.24),
-                    ),
-                    borderRadius: BorderRadius.circular(18),
-                    color: Colors.black.withOpacity(.24),
-                  ),
-                  child: Text(
-                    transcript,
-                    textAlign: TextAlign.center,
-                    textDirection: TextDirection.rtl,
-                    maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 15),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                SmartisLogPanel(entries: logs),
-                const SizedBox(height: 10),
-                Text(
-                  'Smartis • فارسی / English • Auto Online / Offline',
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: gold.withOpacity(.58),
-                    letterSpacing: .6,
-                  ),
-                ),
-                const SizedBox(height: 6),
-              ],
+                );
+              },
             ),
           ),
         ),

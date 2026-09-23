@@ -20,20 +20,13 @@ from services.whisper_service import WhisperService
 from services.wake_word import detect_wake_word
 from services.speech_router import SpeechRouter
 from services.tts_service import TTSService
+from services.google_voice import GoogleVoiceSession
 from agent.planner import plan_with_ollama, fallback_plan
 from agent.executor import execute_plan
 from agent.fast_path import fast_plan
 
 
 def audio_diagnostics(path) -> str:
-    """Diagnostics for the uploaded WAV: format info plus both peak and RMS
-    (average) loudness. Peak alone can be misleading — a single loud
-    transient click at the very start/end of a raw audio capture (common
-    when a mic stream is abruptly started/stopped) can pin the peak near
-    0 dB even though the actual spoken content underneath is very quiet.
-    RMS close to peak means genuinely loud/clipped audio throughout;
-    RMS much lower than peak means a brief click is dominating the peak
-    reading while the rest of the clip is near-silent."""
     if audioop is None:
         return "n/a"
     try:
@@ -50,19 +43,15 @@ def audio_diagnostics(path) -> str:
         rms = audioop.rms(frames, width)
         peak_db = 20 * math.log10(peak / 32768.0) if peak > 0 else float("-inf")
         rms_db = 20 * math.log10(rms / 32768.0) if rms > 0 else float("-inf")
-        return (f"ch={channels} width={width}B rate={rate}Hz dur={duration:.2f}s "
-                f"peak={peak_db:.1f}dB rms={rms_db:.1f}dB")
+        return (
+            f"ch={channels} width={width}B rate={rate}Hz dur={duration:.2f}s "
+            f"peak={peak_db:.1f}dB rms={rms_db:.1f}dB"
+        )
     except Exception as exc:
         return f"n/a ({exc})"
 
 
 def trim_wav_edges(path, lead_ms=150, tail_ms=120) -> str:
-    """Strip a short slice off the very start and end of the WAV before it
-    goes to the recognizer. Raw microphone streams commonly produce a loud
-    transient 'pop'/click right where capture starts or stops; left in, it
-    can dominate the file (and confuse VAD-based silence detection) even
-    though the actual speech elsewhere in the clip is fine. If the clip is
-    too short to trim safely, the original file is used unchanged."""
     try:
         with wave.open(str(path), "rb") as wf:
             channels = wf.getnchannels()
@@ -74,7 +63,7 @@ def trim_wav_edges(path, lead_ms=150, tail_ms=120) -> str:
         tail = int(rate * tail_ms / 1000) * channels * width
         if n <= 0 or lead + tail >= len(frames):
             return str(path)
-        trimmed = frames[lead: len(frames) - tail]
+        trimmed = frames[lead : len(frames) - tail]
         if not trimmed:
             return str(path)
         out_path = str(path) + ".trim.wav"
@@ -88,7 +77,7 @@ def trim_wav_edges(path, lead_ms=150, tail_ms=120) -> str:
         return str(path)
 
 
-app = FastAPI(title="Smartis Backend", version="0.7.0")
+app = FastAPI(title="Smartis Backend", version="0.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,21 +89,28 @@ app.add_middleware(
 whisper = WhisperService()
 speech = SpeechRouter(whisper)
 tts = TTSService(speech.internet)
+voice_session = GoogleVoiceSession(whisper_service=whisper, internet_monitor=speech.internet)
 
 
 @app.on_event("startup")
 def startup():
     whisper.load()
     status = speech.status()
+    mics = GoogleVoiceSession.get_microphones()
     print("=" * 60)
     print("SMARTIS backend ready")
-    print(f"  internet reachable : {status['internet']}")
-    print(f"  Google STT ready   : {status['online_stt_ready']}  (used when online)")
-    print(f"  Whisper STT ready  : {status['offline_stt_ready']}  (used when offline "
-          f"or Google fails)  model={MODEL_PATH}")
-    if not status["offline_stt_ready"]:
-        print(f"  -> {whisper.error}")
+    print(f"  Internet reachable  : {status['internet']}")
+    print(f"  PyAudio available   : {voice_session.is_pyaudio_available}")
+    print(f"  Microphones found   : {len(mics)}")
+    print(f"  Google STT ready    : {status['online_stt_ready']} (recognize_google)")
+    print(f"  Whisper STT ready   : {status['offline_stt_ready']} (model={MODEL_PATH})")
     print("=" * 60)
+
+
+@app.on_event("shutdown")
+def shutdown():
+    print("[Shutdown] Stopping voice session and releasing audio devices...")
+    voice_session.stop()
 
 
 @app.get("/health")
@@ -125,6 +121,7 @@ def health():
         "whisper_ready": whisper.ready,
         "whisper_model": str(MODEL_PATH),
         **speech.status(),
+        "pyaudio_available": voice_session.is_pyaudio_available,
         "online_tts_engine": "edge-tts",
         "offline_tts": True,
         "online_tts": True,
@@ -137,6 +134,18 @@ def status():
         "ok": True,
         "speech": speech.status(),
         "whisper_ready": whisper.ready,
+        "pyaudio_available": voice_session.is_pyaudio_available,
+        "current_voice_mode": voice_session.current_mode,
+    }
+
+
+@app.get("/microphones")
+def list_microphones():
+    mics = GoogleVoiceSession.get_microphones()
+    return {
+        "ok": True,
+        "pyaudio_available": voice_session.is_pyaudio_available,
+        "microphones": mics,
     }
 
 
@@ -175,10 +184,6 @@ async def transcribe(audio: UploadFile = File(...), language_hint: str | None = 
     trimmed_path = trim_wav_edges(raw_path)
     try:
         result = await asyncio.to_thread(speech.transcribe, trimmed_path, language_hint, False)
-        print(f"[transcribe] ok={result.get('ok')} provider={result.get('provider')} "
-              f"offline={result.get('offline')} text={result.get('text')!r} "
-              f"error={result.get('error')} google_attempted={result.get('google_attempted')} "
-              f"raw=[{audio_diagnostics(raw_path)}] trimmed=[{audio_diagnostics(trimmed_path)}]")
         return result
     finally:
         cleanup(raw_path)
@@ -194,10 +199,6 @@ async def wake_audio(audio: UploadFile = File(...)):
         result = await asyncio.to_thread(speech.transcribe, trimmed_path, None, True)
         text = str(result.get("text", ""))
         detection = result.get("wake") or detect_wake_word(text)
-        print(f"[wake_audio] ok={result.get('ok')} provider={result.get('provider')} "
-              f"text={text!r} detected={detection.get('detected')} "
-              f"error={result.get('error')} google_attempted={result.get('google_attempted')} "
-              f"raw=[{audio_diagnostics(raw_path)}] trimmed=[{audio_diagnostics(trimmed_path)}]")
         return {
             "ok": bool(result.get("ok")),
             "detected": bool(detection.get("detected")),
@@ -236,8 +237,6 @@ async def speak(payload: dict):
     if not text:
         return {"ok": False, "error": "Text is empty."}
     result = await asyncio.to_thread(tts.speak, text, language)
-    print(f"[speak] ok={result.get('ok')} provider={result.get('provider')} "
-          f"offline={result.get('offline')} error={result.get('error')}")
     return result
 
 
@@ -263,6 +262,69 @@ async def agent_execute(payload: dict):
     return await asyncio.to_thread(execute_plan, plan, confirmed)
 
 
+# ==========================================
+# Dedicated /voice WebSocket (Voice Control)
+# ==========================================
+@app.websocket("/voice")
+async def voice_websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+
+    async def send_voice_event(event: dict):
+        try:
+            await websocket.send_json(event)
+        except Exception:
+            pass
+
+    # Attach this websocket as the active event listener for the single voice session
+    voice_session.set_event_callback(send_voice_event, loop)
+
+    # Initial ready handshake
+    await websocket.send_json({
+        "type": "voice_ready",
+        "pyaudio_available": voice_session.is_pyaudio_available,
+        "online_stt_ready": speech.google.ready,
+        "offline_stt_ready": whisper.ready,
+        "internet": speech.internet.is_online(),
+        "mode": voice_session.current_mode,
+    })
+
+    try:
+        while True:
+            message = await websocket.receive_json()
+            action = message.get("action")
+
+            if action == "start":
+                mode = message.get("mode", "wake")
+                lang = message.get("language", "fa")
+                if mode == "wake":
+                    voice_session.start_wake(language=lang)
+                elif mode == "command":
+                    voice_session.start_command(language=lang)
+                else:
+                    await websocket.send_json({
+                        "type": "voice_error",
+                        "message": f"Unknown voice mode: {mode}",
+                    })
+            elif action == "stop":
+                voice_session.stop()
+            elif action == "ping":
+                await websocket.send_json({"type": "pong"})
+            else:
+                await websocket.send_json({
+                    "type": "voice_error",
+                    "message": f"Unknown voice action: {action}",
+                })
+    except WebSocketDisconnect:
+        print("[/voice] WebSocket client disconnected.")
+    finally:
+        voice_session.stop()
+        voice_session.set_event_callback(None, None)
+
+
+# ==========================================
+# General /ws WebSocket (System & Agent Control)
+# ==========================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -271,6 +333,7 @@ async def websocket_endpoint(websocket: WebSocket):
         "whisper_ready": whisper.ready,
         "internet": speech.internet.is_online(),
         "online_stt_ready": speech.google.ready,
+        "pyaudio_available": voice_session.is_pyaudio_available,
     })
 
     try:
@@ -284,6 +347,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({
                     "type": "status",
                     "whisper_ready": whisper.ready,
+                    "pyaudio_available": voice_session.is_pyaudio_available,
                     **speech.status(),
                 })
             elif action == "speak":
@@ -296,13 +360,17 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "agent_plan":
                 text = str(message.get("text", "")).strip()
                 language = message.get("language")
-                result = await asyncio.to_thread(
-                    plan_with_ollama,
-                    text,
-                    language,
-                )
-                if not result.get("ok"):
-                    result = fallback_plan(text)
+                fast = fast_plan(text, language)
+                if fast is not None:
+                    result = fast
+                else:
+                    result = await asyncio.to_thread(
+                        plan_with_ollama,
+                        text,
+                        language,
+                    )
+                    if not result.get("ok"):
+                        result = fallback_plan(text)
                 await websocket.send_json({"type": "agent_plan", **result})
             elif action == "agent_execute":
                 result = await asyncio.to_thread(

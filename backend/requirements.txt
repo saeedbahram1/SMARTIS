@@ -7,7 +7,7 @@ pyttsx3>=2.98,<3
 psutil>=6,<7
 python-multipart>=0.0.9,<1
 requests>=2.32,<3
-pywin32>=306
+pywin32>=306; sys_platform == 'win32'
 SpeechRecognition>=3.14,<4
 PyAudio>=0.2.14,<0.3
 edge-tts>=7.2,<8

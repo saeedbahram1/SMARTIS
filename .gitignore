@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Environment Variables
+.env
+!.env.example
+
+# Temporary audio files
+*.wav
+*.trim.wav
+*.mp3
+*.tmp
+
+# Flutter & Dart
+.dart_tool/
+frontend/.dart_tool/
+frontend/build/
+frontend/windows/flutter/ephemeral/
+*.lock
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+.idea/

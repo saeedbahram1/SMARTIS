@@ -49,3 +49,27 @@ class WhisperService:
             return {'ok':True,'text':text,'language':getattr(info,'language',None),'language_probability':getattr(info,'language_probability',None),'offline':True,'provider':'offline-whisper'}
         except Exception as exc:
             return {'ok':False,'error':str(exc),'provider':'offline-whisper','offline':True}
+
+    def transcribe_audio_data(self, audio_data, language_hint=None, fast=False):
+        """Transcribe SpeechRecognition AudioData directly with Whisper, ensuring
+        any temporary file used is cleanly deleted immediately."""
+        import tempfile
+        import os
+        if not self.ready:
+            return {'ok':False,'error':self.error or 'Whisper is not ready.','provider':'offline-whisper','offline':True}
+        temp_path = None
+        try:
+            wav_bytes = audio_data.get_wav_data()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(wav_bytes)
+                temp_path = f.name
+            return self.transcribe_file(temp_path, language_hint=language_hint, fast=fast)
+        except Exception as exc:
+            return {'ok':False,'error':f'Whisper audio data transcription failed: {exc}','provider':'offline-whisper','offline':True}
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+

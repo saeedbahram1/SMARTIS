@@ -20,6 +20,7 @@ class BackendSocket {
   Future<Map<String,dynamic>> speak(String text,String? language) async=>_json(await http.post(Uri.parse('$baseUrl/speak'),headers:{'Content-Type':'application/json'},body:jsonEncode({'text':text,'language':language})));
   Future<Map<String,dynamic>> plan(String text,String? language) async=>_json(await http.post(Uri.parse('$baseUrl/agent/plan'),headers:{'Content-Type':'application/json'},body:jsonEncode({'text':text,'language':language})));
   Future<Map<String,dynamic>> execute(Map<String,dynamic> plan,{bool confirmed=false}) async=>_json(await http.post(Uri.parse('$baseUrl/agent/execute'),headers:{'Content-Type':'application/json'},body:jsonEncode({'plan':plan,'confirmed':confirmed})));
+  Future<Map<String,dynamic>> getMicrophones() async=>_json(await http.get(Uri.parse('$baseUrl/microphones')));
   void ping()=>_channel?.sink.add(jsonEncode({'action':'ping'}));
   void dispose()=>_channel?.sink.close();
 }
