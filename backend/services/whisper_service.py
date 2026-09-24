@@ -32,7 +32,7 @@ class WhisperService:
                     # A short domain prompt nudges decoding toward assistant-style
                     # commands (app/website names, Persian function words) instead
                     # of drifting toward unrelated vocabulary on noisy audio.
-                    'initial_prompt':'اسمارتیز، کروم، گوگل، باز کن، ببند، فایل، پوشه، جستجو کن، بفرست، Smartis, Chrome, Google, open, close, search',
+                    'initial_prompt':'اسمارتیز، سعید، کروم، گوگل، باز کن، ببند، فایل، پوشه، جستجو کن، بفرست، Smartis, Saeed, Chrome, Google, open, close, search',
                 }
                 kwargs['language']=language_hint if language_hint in ('fa','en') else None
                 if fast:

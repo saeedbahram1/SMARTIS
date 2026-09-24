@@ -36,8 +36,11 @@ def detect_wake_word(text):
     normalized=normalize(text); compact=normalized.replace(' ','')
     if not compact: return {'detected':False,'language':None,'wake_word':None}
     aliases=list(WAKE_WORDS)+[
-        'اسمارتی','اسمارتیص','اسمارت','ای اسمارت','هی اسمارتیز','سلام اسمارتیز','الو اسمارتیز','بگو اسمارتیز',
-        'smartis','smarties','smart is','hey smartis','hi smartis','smartiz','smartist','smartest','smartees','سمارتیز','اسمارتز'
+        'سعید', 'سعید جان', 'اقا سعید', 'آقا سعید', 'سید',
+        'saeed', 'saeid', 'sayeed',
+        'اسمارتی', 'اسمارتیص', 'اسمارتیس', 'اسمارت', 'ای اسمارت', 'هی اسمارتیز', 'سلام اسمارتیز', 'الو اسمارتیز', 'بگو اسمارتیز',
+        'smartis', 'smarties', 'smart is', 'hey smartis', 'hi smartis', 'smartiz', 'smartist', 'smartest', 'smartees', 'سمارتیز', 'اسمارتز',
+        'جانم', 'اسمارتیزم', 'اسمارتس'
     ]
     words=normalized.split()
     for alias in aliases:

@@ -21,6 +21,7 @@ from config import (
     MIC_DEVICE_INDEX,
     SMARTIS_GOOGLE_FA_LANGUAGE,
     SMARTIS_GOOGLE_EN_LANGUAGE,
+    SMARTIS_ENERGY_THRESHOLD,
     SMARTIS_AMBIENT_CALIBRATION_SECONDS,
     SMARTIS_PHRASE_TIME_LIMIT_SECONDS,
     SMARTIS_PAUSE_THRESHOLD,
@@ -100,9 +101,11 @@ class GoogleVoiceSession:
             self.recognizer = None
             return
         r = sr.Recognizer()
-        r.dynamic_energy_threshold = False
-        r.energy_threshold = 160.0
-        r.pause_threshold = SMARTIS_PAUSE_THRESHOLD
+        r.dynamic_energy_threshold = True
+        r.energy_threshold = SMARTIS_ENERGY_THRESHOLD
+        r.dynamic_energy_adjustment_damping = 0.15
+        r.dynamic_energy_ratio = 1.5
+        r.pause_threshold = 0.45
         r.non_speaking_duration = SMARTIS_NON_SPEAKING_DURATION
         r.phrase_threshold = SMARTIS_PHRASE_THRESHOLD
         self.recognizer = r
@@ -239,16 +242,17 @@ class GoogleVoiceSession:
                     try:
                         self.recognizer.adjust_for_ambient_noise(
                             source,
-                            duration=SMARTIS_AMBIENT_CALIBRATION_SECONDS,
+                            duration=min(0.3, SMARTIS_AMBIENT_CALIBRATION_SECONDS),
                         )
-                        # Clamp energy_threshold to sensible bounds:
-                        # Never let it exceed 320 (which makes it deaf), nor below 90
-                        self.recognizer.energy_threshold = max(90.0, min(self.recognizer.energy_threshold, 300.0))
+                        # Keep threshold strictly in human voice range:
+                        # Floor 40.0, ceiling 110.0 so speech (150-350 RMS) is never blocked!
+                        target_cap = max(65.0, min(SMARTIS_ENERGY_THRESHOLD, 110.0))
+                        self.recognizer.energy_threshold = max(40.0, min(self.recognizer.energy_threshold, target_cap))
                         self._calibrated = True
-                        print(f"[Smartis Voice] Calibrated ambient noise: energy_threshold={self.recognizer.energy_threshold:.1f}")
+                        print(f"[Smartis Voice] Calibrated ambient noise: energy_threshold={self.recognizer.energy_threshold:.1f} (ready for 'اسمارتیز' / 'سعید')")
                     except Exception as exc:
                         print(f"[Smartis Voice] Ambient noise calibration warning: {exc}")
-                        self.recognizer.energy_threshold = 160.0
+                        self.recognizer.energy_threshold = SMARTIS_ENERGY_THRESHOLD
 
                     self._emit({
                         "type": "calibrating",
@@ -265,6 +269,12 @@ class GoogleVoiceSession:
                     if current_mode == "idle":
                         break
 
+                    # Dynamically set pause_threshold: tight for wake word, normal for commands
+                    if current_mode == "wake":
+                        self.recognizer.pause_threshold = 0.45
+                    else:
+                        self.recognizer.pause_threshold = SMARTIS_PAUSE_THRESHOLD
+
                     self._emit({
                         "type": "listening",
                         "mode": current_mode,
@@ -276,7 +286,7 @@ class GoogleVoiceSession:
                         if current_mode == "wake"
                         else SMARTIS_PHRASE_TIME_LIMIT_SECONDS
                     )
-                    timeout = 5.0 if current_mode == "wake" else 15.0
+                    timeout = 4.0 if current_mode == "wake" else 15.0
 
                     try:
                         audio = self.recognizer.listen(
@@ -351,10 +361,11 @@ class GoogleVoiceSession:
                         wake_check = detect_wake_word(text)
                         if wake_check.get("detected"):
                             detected_wake_lang = wake_check.get("language") or detected_lang
-                            print(f"[Smartis Voice] WAKE DETECTED! word='{wake_check.get('wake_word')}' lang={detected_wake_lang}")
+                            w_word = wake_check.get("wake_word")
+                            print(f"[Smartis Voice] >>> WAKE WORD MATCHED: '{w_word}'! Replying 'جانم'... <<<")
                             self._emit({
                                 "type": "wake_detected",
-                                "wake_word": wake_check.get("wake_word"),
+                                "wake_word": w_word,
                                 "language": detected_wake_lang,
                                 "text": text,
                                 "provider": provider,
@@ -365,7 +376,7 @@ class GoogleVoiceSession:
                                 self._mode = "idle"
                             break
                         else:
-                            print(f"[Smartis Voice] Heard '{text}', wake word not matched.")
+                            print(f"[Smartis Voice] Heard: '{text}' (no wake match; say 'اسمارتیز' or 'سعید')")
                             self._emit({
                                 "type": "wake_miss",
                                 "text": text,
@@ -401,7 +412,8 @@ class GoogleVoiceSession:
 
         # 1. Online pass via Google recognize_google
         if self.internet.is_online() and self.recognizer is not None:
-            # When waking, try primary language (fa) and alternate (en)
+            # When waking, timeout quickly (2.0s) so Whisper can step in if Google hangs
+            google_timeout = 2.0 if fast else GOOGLE_STT_TIMEOUT
             langs_to_try = [language]
             if fast:
                 alt = "en" if language == "fa" else "fa"
@@ -416,7 +428,7 @@ class GoogleVoiceSession:
                             audio,
                             language=lang_tag,
                         )
-                        text = future.result(timeout=GOOGLE_STT_TIMEOUT).strip()
+                        text = future.result(timeout=google_timeout).strip()
 
                     if text:
                         print(f"[Smartis Voice] Google STT ({lang_tag}) -> '{text}'")
@@ -432,11 +444,11 @@ class GoogleVoiceSession:
                         if not fast:
                             return stt_result
                 except concurrent.futures.TimeoutError:
-                    print(f"[Smartis Voice] Google STT ({lang_tag}) timed out ({GOOGLE_STT_TIMEOUT}s)")
+                    print(f"[Smartis Voice] Google STT ({lang_tag}) timed out after {google_timeout}s")
                 except sr.UnknownValueError:
                     pass
                 except Exception as exc:
-                    print(f"[Smartis Voice] Google STT error: {exc}")
+                    print(f"[Smartis Voice] Google STT ({lang_tag}) notice: {exc}")
 
         # If Google found text and wake word matched, return it
         if stt_result and stt_result.get("ok"):

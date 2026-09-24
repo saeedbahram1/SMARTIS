@@ -27,7 +27,7 @@ class _SmartisAppState extends State<SmartisApp> {
   double audioLevel = 0.0;
 
   String status = 'در حال اتصال به سرور...';
-  String transcript = 'بگو «اسمارتیز»';
+  String transcript = 'بگو «اسمارتیز» یا «سعید»';
   String detectedLanguage = 'fa';
   String mode = 'ONLINE';
 
@@ -126,14 +126,14 @@ class _SmartisAppState extends State<SmartisApp> {
           _log('Listening for wake word');
           setState(() {
             visualState = SmartisVisualState.listening;
-            status = 'در حال شنیدن... بگو «اسمارتیز»';
+            status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
           });
         } else {
           // If session is idle or newly connected, start wake listening
           _log('Starting wake listening...');
           setState(() {
             visualState = SmartisVisualState.listening;
-            status = 'در حال شنیدن... بگو «اسمارتیز»';
+            status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
           });
           _startWakeListening();
         }
@@ -153,8 +153,8 @@ class _SmartisAppState extends State<SmartisApp> {
           _log('Listening for wake word');
           setState(() {
             visualState = SmartisVisualState.listening;
-            status = 'در حال شنیدن... بگو «اسمارتیز»';
-            transcript = 'بگو «اسمارتیز»';
+            status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
+            transcript = 'بگو «اسمارتیز» یا «سعید»';
           });
         } else if (currentMode == 'command') {
           _log('Listening for command');
@@ -193,7 +193,7 @@ class _SmartisAppState extends State<SmartisApp> {
         }
         setState(() {
           visualState = SmartisVisualState.listening;
-          status = 'در حال شنیدن... بگو «اسمارتیز»';
+          status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
         });
         break;
 
@@ -248,7 +248,8 @@ class _SmartisAppState extends State<SmartisApp> {
   Future<void> _onWakeDetected(Map<String, dynamic> event) async {
     if (!mounted || shuttingDown || processing) return;
 
-    _log('Wake detected');
+    final wakeWord = (event['wake_word'] ?? event['text'] ?? 'اسمارتیز').toString();
+    _log('Wake detected: $wakeWord');
     final language = (event['language'] ?? 'fa').toString();
     detectedLanguage = language;
     final reply = language == 'fa' ? 'جانم' : "Yes, I'm listening.";
@@ -256,7 +257,7 @@ class _SmartisAppState extends State<SmartisApp> {
     setState(() {
       visualState = SmartisVisualState.speaking;
       status = reply;
-      transcript = (event['text'] ?? 'اسمارتیز').toString();
+      transcript = wakeWord;
       mode = event['offline'] == true ? 'OFFLINE' : 'ONLINE';
     });
 
@@ -467,7 +468,7 @@ class _SmartisAppState extends State<SmartisApp> {
   String _stateText() {
     switch (visualState) {
       case SmartisVisualState.idle:
-        return 'بگو «اسمارتیز»';
+        return 'بگو «اسمارتیز» یا «سعید»';
       case SmartisVisualState.listening:
         return 'گوش می‌دهم...';
       case SmartisVisualState.thinking:
