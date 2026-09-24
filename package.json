@@ -1,9 +1,0 @@
-{
-  "name": "smartis",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Smartis AI Assistant - Flutter Windows + Python FastAPI",
-  "scripts": {
-    "build": "echo 'Smartis build verified'"
-  }
-}
