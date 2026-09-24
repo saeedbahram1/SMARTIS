@@ -181,6 +181,16 @@ class GoogleVoiceSession:
             })
             return False
 
+        with self._lock:
+            if self._mode == mode and self._language == language and self._thread and self._thread.is_alive():
+                self._emit({
+                    "type": "voice_ready",
+                    "mode": mode,
+                    "language": language,
+                    "device_index": self._device_index,
+                })
+                return True
+
         # Stop existing background listener to satisfy the ONE microphone rule
         self._stop_listening()
         self._stop_requested.clear()

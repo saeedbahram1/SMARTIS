@@ -1,0 +1,8 @@
+{
+  "name": "Smartis",
+  "description": "Smartis Voice Assistant Desktop Application (Flutter Windows + FastAPI)",
+  "version": "0.8.0",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

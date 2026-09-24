@@ -289,6 +289,10 @@ async def voice_websocket_endpoint(websocket: WebSocket):
         "mode": voice_session.current_mode,
     })
 
+    # If the voice session is idle and audio subsystem is ready, automatically start wake word listening
+    if voice_session.current_mode == "idle" and voice_session.is_pyaudio_available:
+        voice_session.start_wake(language="fa")
+
     try:
         while True:
             message = await websocket.receive_json()

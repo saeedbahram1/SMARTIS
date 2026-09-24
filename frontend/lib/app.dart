@@ -41,6 +41,13 @@ class _SmartisAppState extends State<SmartisApp> {
     super.initState();
 
     // 1. Connect to general backend WebSocket for health & agent execution
+    _initBackendSocket();
+
+    // 2. Connect to dedicated /voice WebSocket managing PyAudio & Google STT
+    _initVoiceSession();
+  }
+
+  void _initBackendSocket() {
     backend.connect(
       onMessage: (message) {
         if (!mounted) return;
@@ -48,6 +55,9 @@ class _SmartisAppState extends State<SmartisApp> {
           final online = message['internet'] == true;
           setState(() {
             mode = online ? 'ONLINE' : 'OFFLINE';
+            if (status == 'در حال اتصال به سرور...') {
+              status = 'متصل به سرور • در انتظار میکروفون...';
+            }
           });
           _log('Backend connected • internet=$online • provider=google_stt');
         }
@@ -55,13 +65,15 @@ class _SmartisAppState extends State<SmartisApp> {
       onError: (error) {
         _log('Backend error: $error');
         if (mounted) {
-          setState(() => status = 'Backend پیدا نشد');
+          setState(() => status = 'سرور پایتون در دسترس نیست. تلاش مجدد...');
+          Future.delayed(const Duration(seconds: 3), () {
+            if (mounted && !shuttingDown) {
+              _initBackendSocket();
+            }
+          });
         }
       },
     );
-
-    // 2. Connect to dedicated /voice WebSocket managing PyAudio & Google STT
-    _initVoiceSession();
   }
 
   void _initVoiceSession() {
@@ -70,7 +82,7 @@ class _SmartisAppState extends State<SmartisApp> {
       onError: (err) {
         _log('Voice connection error: $err');
         if (mounted) {
-          setState(() => status = 'خطا در اتصال صوتی');
+          setState(() => status = 'در حال تلاش برای اتصال صوتی...');
         }
         // Attempt reconnect after brief delay
         Future.delayed(const Duration(seconds: 3), () {
@@ -81,6 +93,14 @@ class _SmartisAppState extends State<SmartisApp> {
       },
       onDone: () {
         _log('Voice session closed');
+        if (mounted) {
+          setState(() => status = 'ارتباط صوتی قطع شد. تلاش مجدد...');
+        }
+        Future.delayed(const Duration(seconds: 3), () {
+          if (mounted && !shuttingDown && !voiceClient.isConnected) {
+            _initVoiceSession();
+          }
+        });
       },
     );
   }
@@ -92,13 +112,30 @@ class _SmartisAppState extends State<SmartisApp> {
     switch (type) {
       case 'voice_ready':
         _log('Microphone initialized');
-        final currentMode = event['mode']?.toString() ?? 'wake';
+        final pyaudioAvailable = event['pyaudio_available'] != false;
+        if (!pyaudioAvailable) {
+          _log('PyAudio is not available on Python backend');
+          setState(() {
+            status = 'خطا: PyAudio در پایتون نصب نیست';
+          });
+          break;
+        }
+
+        final currentMode = event['mode']?.toString() ?? 'idle';
         if (currentMode == 'wake') {
           _log('Listening for wake word');
           setState(() {
             visualState = SmartisVisualState.listening;
             status = 'در حال شنیدن... بگو «اسمارتیز»';
           });
+        } else {
+          // If session is idle or newly connected, start wake listening
+          _log('Starting wake listening...');
+          setState(() {
+            visualState = SmartisVisualState.listening;
+            status = 'در حال شنیدن... بگو «اسمارتیز»';
+          });
+          _startWakeListening();
         }
         break;
 
@@ -166,7 +203,8 @@ class _SmartisAppState extends State<SmartisApp> {
         break;
 
       case 'voice_fatal':
-        _log('Voice fatal: ${event['error']}');
+        final errMsg = event['error']?.toString() ?? '';
+        _log('Voice fatal: $errMsg');
         setState(() => status = 'میکروفون در دسترس نیست');
         break;
 

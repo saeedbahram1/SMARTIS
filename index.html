@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smartis</title>
+  <meta name="description" content="Smartis Voice Assistant Desktop Application (Flutter Windows + FastAPI)" />
+  <meta property="og:title" content="Smartis" />
+  <meta property="og:description" content="Smartis Voice Assistant Desktop Application (Flutter Windows + FastAPI)" />
+  <style>
+    :root {
+      --gold: #ffd700;
+      --gold-dim: rgba(255, 215, 0, 0.6);
+      --bg: #0d0f12;
+      --card-bg: rgba(25, 28, 35, 0.85);
+      --card-border: rgba(255, 215, 0, 0.2);
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Tahoma, sans-serif;
+    }
+    body {
+      background: radial-gradient(circle at top, #1a1e28 0%, var(--bg) 75%);
+      color: #e6e6e6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px;
+    }
+    .container {
+      max-width: 680px;
+      width: 100%;
+      text-align: center;
+    }
+    .orb-mock {
+      width: 130px;
+      height: 130px;
+      margin: 0 auto 20px;
+      border-radius: 50%;
+      background: radial-gradient(circle, #ffd700 10%, #d4af37 40%, rgba(255, 215, 0, 0.05) 75%);
+      box-shadow: 0 0 45px rgba(255, 215, 0, 0.35);
+      animation: pulse 3.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(0.96); box-shadow: 0 0 35px rgba(255, 215, 0, 0.25); }
+      50% { transform: scale(1.04); box-shadow: 0 0 55px rgba(255, 215, 0, 0.45); }
+    }
+    h1 {
+      color: var(--gold);
+      letter-spacing: 8px;
+      font-size: 26px;
+      margin-bottom: 8px;
+      text-indent: 8px;
+    }
+    .subtitle {
+      color: var(--gold-dim);
+      font-size: 13px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 16px;
+      text-align: right;
+      backdrop-filter: blur(8px);
+    }
+    .card h2 {
+      font-size: 15px;
+      color: var(--gold);
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      background: rgba(255, 215, 0, 0.15);
+      color: var(--gold);
+      border: 1px solid rgba(255, 215, 0, 0.3);
+    }
+    ul {
+      list-style-type: none;
+      font-size: 13px;
+      line-height: 1.8;
+      color: #cfd4dc;
+    }
+    li::before {
+      content: "✦ ";
+      color: var(--gold);
+    }
+    code {
+      background: #000;
+      color: var(--gold);
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      direction: ltr;
+      display: inline-block;
+    }
+    .footer {
+      font-size: 11px;
+      color: rgba(255, 215, 0, 0.5);
+      margin-top: 24px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="orb-mock"></div>
+    <h1>SMARTIS</h1>
+    <p class="subtitle">دستیار هوشمند صوتی ویندوز • Flutter Desktop + FastAPI Python</p>
+
+    <div class="card">
+      <h2><span>معماری نیتیو برنامه</span> <span class="badge">Desktop Application</span></h2>
+      <ul>
+        <li><strong>Frontend:</strong> فلاتر دسکتاپ ویندوز (پوشه <code>frontend/</code> با پشتیبانی کامل ویندوز)</li>
+        <li><strong>Backend:</strong> سرور لوکال پایتون FastAPI روی پورت <code>127.0.0.1:8765</code></li>
+        <li><strong>تشخیص گفتار صوتی:</strong> آنلاین با Google STT و آفلاین با Whisper</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2><span>اجرا در سیستم محلی ویندوز</span> <span class="badge">Local Windows</span></h2>
+      <ul>
+        <li>برای اجرای سرور بک‌اند: فایل <code>run_backend.bat</code> را اجرا کنید.</li>
+        <li>برای اجرای رابط کاربری فلاتر: فایل <code>run_frontend.bat</code> را اجرا کنید.</li>
+        <li>برای بررسی و آماده‌سازی نیازمندی‌های صوتی: فایل <code>INSTALL_GOOGLE_AUDIO.bat</code> در دسترس است.</li>
+      </ul>
+    </div>
+
+    <div class="footer">
+      Smartis Voice Assistant • Native Windows Platform
+    </div>
+  </div>
+</body>
+</html>
