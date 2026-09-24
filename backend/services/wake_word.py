@@ -35,7 +35,10 @@ def _levenshtein_leq(a,b,max_dist):
 def detect_wake_word(text):
     normalized=normalize(text); compact=normalized.replace(' ','')
     if not compact: return {'detected':False,'language':None,'wake_word':None}
-    aliases=list(WAKE_WORDS)+['اسمارتی','اسمارتیص','اسمارت','ای اسمارت','هی اسمارتیز','smartis','smarties','smart is','hey smartis']
+    aliases=list(WAKE_WORDS)+[
+        'اسمارتی','اسمارتیص','اسمارت','ای اسمارت','هی اسمارتیز','سلام اسمارتیز','الو اسمارتیز','بگو اسمارتیز',
+        'smartis','smarties','smart is','hey smartis','hi smartis','smartiz','smartist','smartest','smartees','سمارتیز','اسمارتز'
+    ]
     words=normalized.split()
     for alias in aliases:
         c=normalize(alias); cc=c.replace(' ','')

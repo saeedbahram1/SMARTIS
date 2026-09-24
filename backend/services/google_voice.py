@@ -100,7 +100,8 @@ class GoogleVoiceSession:
             self.recognizer = None
             return
         r = sr.Recognizer()
-        r.dynamic_energy_threshold = True
+        r.dynamic_energy_threshold = False
+        r.energy_threshold = 160.0
         r.pause_threshold = SMARTIS_PAUSE_THRESHOLD
         r.non_speaking_duration = SMARTIS_NON_SPEAKING_DURATION
         r.phrase_threshold = SMARTIS_PHRASE_THRESHOLD
@@ -235,19 +236,26 @@ class GoogleVoiceSession:
             with mic as source:
                 # One-time ambient calibration if needed
                 if not self._calibrated and not self._stop_requested.is_set():
-                    self._emit({
-                        "type": "calibrating",
-                        "duration": SMARTIS_AMBIENT_CALIBRATION_SECONDS,
-                        "mode": mode,
-                    })
                     try:
                         self.recognizer.adjust_for_ambient_noise(
                             source,
                             duration=SMARTIS_AMBIENT_CALIBRATION_SECONDS,
                         )
+                        # Clamp energy_threshold to sensible bounds:
+                        # Never let it exceed 320 (which makes it deaf), nor below 90
+                        self.recognizer.energy_threshold = max(90.0, min(self.recognizer.energy_threshold, 300.0))
                         self._calibrated = True
+                        print(f"[Smartis Voice] Calibrated ambient noise: energy_threshold={self.recognizer.energy_threshold:.1f}")
                     except Exception as exc:
-                        logger.warning(f"Ambient noise calibration warning: {exc}")
+                        print(f"[Smartis Voice] Ambient noise calibration warning: {exc}")
+                        self.recognizer.energy_threshold = 160.0
+
+                    self._emit({
+                        "type": "calibrating",
+                        "duration": SMARTIS_AMBIENT_CALIBRATION_SECONDS,
+                        "mode": mode,
+                        "energy_threshold": round(self.recognizer.energy_threshold, 1),
+                    })
 
                 while not self._stop_requested.is_set():
                     with self._lock:
@@ -268,7 +276,7 @@ class GoogleVoiceSession:
                         if current_mode == "wake"
                         else SMARTIS_PHRASE_TIME_LIMIT_SECONDS
                     )
-                    timeout = None if current_mode == "wake" else 15.0
+                    timeout = 5.0 if current_mode == "wake" else 15.0
 
                     try:
                         audio = self.recognizer.listen(
@@ -303,9 +311,13 @@ class GoogleVoiceSession:
                     if self._stop_requested.is_set():
                         break
 
+                    audio_dur = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+                    print(f"[Smartis Voice] Audio captured ({audio_dur:.2f}s)! Running STT...")
+
                     self._emit({
                         "type": "speech_captured",
                         "mode": current_mode,
+                        "duration": round(audio_dur, 2),
                     })
 
                     # Perform STT
@@ -339,6 +351,7 @@ class GoogleVoiceSession:
                         wake_check = detect_wake_word(text)
                         if wake_check.get("detected"):
                             detected_wake_lang = wake_check.get("language") or detected_lang
+                            print(f"[Smartis Voice] WAKE DETECTED! word='{wake_check.get('wake_word')}' lang={detected_wake_lang}")
                             self._emit({
                                 "type": "wake_detected",
                                 "wake_word": wake_check.get("wake_word"),
@@ -351,6 +364,13 @@ class GoogleVoiceSession:
                             with self._lock:
                                 self._mode = "idle"
                             break
+                        else:
+                            print(f"[Smartis Voice] Heard '{text}', wake word not matched.")
+                            self._emit({
+                                "type": "wake_miss",
+                                "text": text,
+                                "mode": "wake",
+                            })
                         # Otherwise continue listening for wake word
 
                     elif current_mode == "command":
@@ -375,54 +395,74 @@ class GoogleVoiceSession:
                 self._mode = "idle"
 
     def _transcribe_audio(self, audio: sr.AudioData, language: str, fast: bool = False) -> dict[str, Any]:
-        """Convert AudioData to text via Google Web Speech API (online),
-        or fallback directly to faster-whisper without writing temporary files for Google."""
-        lang_tag = SMARTIS_GOOGLE_FA_LANGUAGE if language == "fa" else SMARTIS_GOOGLE_EN_LANGUAGE
+        """Convert AudioData to text via Google Web Speech API (online) with
+        seamless fallback to local Whisper."""
+        stt_result = None
 
-        # Online pass via Google recognize_google
+        # 1. Online pass via Google recognize_google
         if self.internet.is_online() and self.recognizer is not None:
-            try:
-                # Wrap recognize_google in a thread executor with a strict timeout
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        self.recognizer.recognize_google,
-                        audio,
-                        language=lang_tag,
-                    )
-                    text = future.result(timeout=GOOGLE_STT_TIMEOUT).strip()
+            # When waking, try primary language (fa) and alternate (en)
+            langs_to_try = [language]
+            if fast:
+                alt = "en" if language == "fa" else "fa"
+                langs_to_try.append(alt)
 
-                if text:
-                    return {
-                        "ok": True,
-                        "text": text,
-                        "language": language,
-                        "provider": "google",
-                        "offline": False,
-                    }
-            except concurrent.futures.TimeoutError:
-                logger.warning(f"Google STT timed out after {GOOGLE_STT_TIMEOUT}s, falling back to Whisper")
-            except sr.UnknownValueError:
-                # Google could not understand audio (silence or noise)
-                return {
-                    "ok": False,
-                    "error": "Google could not understand the audio.",
-                    "provider": "google",
-                }
-            except (sr.RequestError, Exception) as exc:
-                logger.warning(f"Google STT failed ({exc}), falling back to Whisper")
+            for lang_cand in langs_to_try:
+                lang_tag = SMARTIS_GOOGLE_FA_LANGUAGE if lang_cand == "fa" else SMARTIS_GOOGLE_EN_LANGUAGE
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(
+                            self.recognizer.recognize_google,
+                            audio,
+                            language=lang_tag,
+                        )
+                        text = future.result(timeout=GOOGLE_STT_TIMEOUT).strip()
 
-        # Fallback to local Whisper
+                    if text:
+                        print(f"[Smartis Voice] Google STT ({lang_tag}) -> '{text}'")
+                        stt_result = {
+                            "ok": True,
+                            "text": text,
+                            "language": lang_cand,
+                            "provider": "google",
+                            "offline": False,
+                        }
+                        if fast and detect_wake_word(text).get("detected"):
+                            return stt_result
+                        if not fast:
+                            return stt_result
+                except concurrent.futures.TimeoutError:
+                    print(f"[Smartis Voice] Google STT ({lang_tag}) timed out ({GOOGLE_STT_TIMEOUT}s)")
+                except sr.UnknownValueError:
+                    pass
+                except Exception as exc:
+                    print(f"[Smartis Voice] Google STT error: {exc}")
+
+        # If Google found text and wake word matched, return it
+        if stt_result and stt_result.get("ok"):
+            if not fast or detect_wake_word(stt_result.get("text", "")).get("detected"):
+                return stt_result
+
+        # 2. Fallback to local Whisper
+        # (Runs if Google is filtered/offline, returned UnknownValueError, or didn't detect wake word)
         if self.whisper.ready:
-            logger.info("Using offline Whisper fallback for AudioData transcription")
+            print("[Smartis Voice] Running Whisper STT fallback...")
             whisper_result = self.whisper.transcribe_audio_data(
                 audio,
-                language_hint=language,
+                language_hint=None if fast else language,
                 fast=fast,
             )
-            return whisper_result
+            if whisper_result.get("ok"):
+                print(f"[Smartis Voice] Whisper STT -> '{whisper_result.get('text')}' (lang={whisper_result.get('language')})")
+                return whisper_result
+            else:
+                print(f"[Smartis Voice] Whisper STT failed: {whisper_result.get('error')}")
+
+        if stt_result and stt_result.get("ok"):
+            return stt_result
 
         return {
             "ok": False,
-            "error": "Neither Google STT nor Whisper is available.",
+            "error": "Could not understand audio.",
             "provider": "none",
         }

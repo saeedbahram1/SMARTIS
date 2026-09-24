@@ -141,7 +141,9 @@ class _SmartisAppState extends State<SmartisApp> {
 
       case 'calibrating':
         final dur = event['duration'] ?? 0.7;
-        _log('Calibration complete ($dur s)');
+        final thresh = event['energy_threshold'];
+        final threshInfo = thresh != null ? ' (threshold: $thresh)' : '';
+        _log('Calibration complete ($dur s)$threshInfo');
         setState(() => status = 'کالیبراسیون صدای محیط...');
         break;
 
@@ -165,6 +167,7 @@ class _SmartisAppState extends State<SmartisApp> {
         break;
 
       case 'speech_captured':
+        _log('Voice captured, processing STT...');
         setState(() {
           visualState = SmartisVisualState.thinking;
           status = 'در حال پردازش گفتار...';
@@ -181,6 +184,17 @@ class _SmartisAppState extends State<SmartisApp> {
 
       case 'wake_detected':
         _onWakeDetected(event);
+        break;
+
+      case 'wake_miss':
+        final heard = event['text']?.toString() ?? '';
+        if (heard.isNotEmpty) {
+          _log('Heard: "$heard" (wake word not matched)');
+        }
+        setState(() {
+          visualState = SmartisVisualState.listening;
+          status = 'در حال شنیدن... بگو «اسمارتیز»';
+        });
         break;
 
       case 'command_final':
