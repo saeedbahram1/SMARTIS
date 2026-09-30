@@ -1,0 +1,30 @@
+SMARTIS 2.2 — INSTALL
+
+This folder mirrors your project structure. Copy it over the project root and
+let Windows merge/replace:
+
+    C:\Project\Smartis\   <-- merge this folder into here
+
+Files that will be added:
+    backend/agent/chat.py
+    backend/agent/echo_guard.py
+    backend/agent/logbus.py
+    frontend/lib/widgets/smartis_log_panel.dart
+    frontend/lib/widgets/smartis_chat_panel.dart
+    CHANGELOG_2.2.md
+
+Files that will be replaced:
+    backend/config.py
+    backend/main.py
+    backend/agent/executor.py
+    backend/.env.example
+    frontend/lib/app.dart
+    frontend/lib/services/backend_socket.dart
+
+Nothing else in your project is touched. There are no new dependencies.
+
+Requirements:
+    - Ollama running locally (same as before), model = OLLAMA_MODEL (qwen2.5:7b)
+    - flutter pub get  (no new packages)
+
+Then run START_SMARTIS.bat as usual.

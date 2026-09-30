@@ -130,6 +130,28 @@ class BackendSocket {
     );
   }
 
+  /// Typed-chat endpoint. Always returns a human-style reply, never a dead end.
+  Future<Map<String, dynamic>> chat(
+    String text,
+    String? language,
+  ) async {
+    return _json(
+      await http.post(
+        Uri.parse('$baseUrl/chat'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'text': text, 'language': language}),
+      ),
+    );
+  }
+
+  Future<Map<String, dynamic>> history() async {
+    return _json(await http.get(Uri.parse('$baseUrl/history')));
+  }
+
+  Future<Map<String, dynamic>> logs() async {
+    return _json(await http.get(Uri.parse('$baseUrl/logs')));
+  }
+
   Future<Map<String, dynamic>> plan(
     String text,
     String? language,
@@ -156,7 +178,6 @@ class BackendSocket {
     );
   }
 
-
   Future<Map<String, dynamic>> dashboard() async {
     return _json(await http.get(Uri.parse('$baseUrl/dashboard')));
   }
@@ -164,6 +185,7 @@ class BackendSocket {
   Future<Map<String, dynamic>> setVoice(String language, String gender) async {
     return _json(await http.post(Uri.parse('$baseUrl/voice/settings'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'language': language, 'gender': gender})));
   }
+
   void dispose() {
     _disposed = true;
     _reconnectTimer?.cancel();

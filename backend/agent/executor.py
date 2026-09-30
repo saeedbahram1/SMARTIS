@@ -12,14 +12,12 @@ _PENDING_CONFIRMATION: dict[str, Any] | None = None
 _PENDING_AT: float = 0.0
 _PENDING_TTL = 45.0
 
-
 def validate_actions(actions: list[dict[str, Any]]) -> list[str]:
     errors=[]
     for i, action in enumerate(actions):
         if not isinstance(action, dict): errors.append(f"Action {i} is not an object."); continue
         if not isinstance(action.get("tool"), str) or not action.get("tool"): errors.append(f"Action {i} has no tool.")
     return errors
-
 
 def pending_confirmation() -> bool:
     global _PENDING_CONFIRMATION, _PENDING_AT
@@ -28,11 +26,9 @@ def pending_confirmation() -> bool:
             _PENDING_CONFIRMATION=None; _PENDING_AT=0.0
         return _PENDING_CONFIRMATION is not None
 
-
 def clear_pending_confirmation() -> None:
     global _PENDING_CONFIRMATION, _PENDING_AT
     with _PENDING_LOCK: _PENDING_CONFIRMATION=None; _PENDING_AT=0.0
-
 
 def execute_pending_confirmation() -> dict[str, Any]:
     global _PENDING_CONFIRMATION, _PENDING_AT
@@ -44,7 +40,6 @@ def execute_pending_confirmation() -> dict[str, Any]:
         return {"ok": False, "error": "No pending confirmation."}
     return execute_plan(plan, True)
 
-
 def execute_plan(plan: dict[str, Any], confirmed: bool = False) -> dict[str, Any]:
     global _PENDING_CONFIRMATION, _PENDING_AT
     actions=plan.get("actions",[])
@@ -52,11 +47,14 @@ def execute_plan(plan: dict[str, Any], confirmed: bool = False) -> dict[str, Any
     errors=validate_actions(actions)
     if errors: return {"ok":False,"error":"; ".join(errors)}
     results=[]
-    for action in actions:
+    for index, action in enumerate(actions):
         tool=action["tool"]; args=action.get("args",{}) or {}
         if tool in REQUIRE_CONFIRMATION_FOR and not confirmed:
             with _PENDING_LOCK:
-                _PENDING_CONFIRMATION=dict(plan)
+                # Only the actions that have NOT run yet are stored. Storing the
+                # whole plan made the already-executed prefix run a second time
+                # after the user confirmed (e.g. "open Google, then shut down").
+                _PENDING_CONFIRMATION={**plan, "actions": [dict(item) for item in actions[index:]]}
                 _PENDING_AT=time.time()
             return {"ok":True,"needs_confirmation":True,"tool":tool,"args":args,"results":results}
         result=execute_tool(tool,args)
