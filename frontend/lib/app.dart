@@ -1,646 +1,417 @@
-import 'dart:convert';
+import 'dart:async';
 
+import 'dart:convert';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
-import 'package:window_manager/window_manager.dart';
-
 import 'services/backend_socket.dart';
-import 'services/google_voice_session.dart';
+import 'services/windows_window.dart';
 import 'widgets/smartis_log_panel.dart';
 import 'widgets/smartis_orb.dart';
 
 class SmartisApp extends StatefulWidget {
   const SmartisApp({super.key});
-
   @override
   State<SmartisApp> createState() => _SmartisAppState();
 }
 
 class _SmartisAppState extends State<SmartisApp> {
-  static const Color gold = Color(0xFFFFD700);
-
+  static const gold = Color(0xFFFFD700);
   final BackendSocket backend = BackendSocket();
-  final GoogleVoiceSessionClient voiceClient = GoogleVoiceSessionClient();
   final AudioPlayer player = AudioPlayer();
+  final List<String> logs = [];
+  Timer? clockTimer;
+  Timer? dashboardTimer;
 
   SmartisVisualState visualState = SmartisVisualState.idle;
-  double audioLevel = 0.0;
-
-  String status = 'در حال اتصال به سرور...';
-  String transcript = 'بگو «اسمارتیز» یا «سعید»';
-  String detectedLanguage = 'fa';
-  String mode = 'ONLINE';
-
+  double audioLevel = 0;
+  String status = 'در حال اتصال به Backend...';
+  String transcript = 'فرمان بده...';
+  String detectedLanguage = '';
+  String mode = '...';
   bool processing = false;
   bool shuttingDown = false;
-
-  final List<String> logs = <String>[];
+  DateTime localNow = DateTime.now();
+  Map<String, dynamic> dashboard = {};
+  String faGender = 'female';
+  String enGender = 'male';
+  bool loadingDashboard = false;
 
   @override
   void initState() {
     super.initState();
-
-    // 1. Connect to general backend WebSocket for health & agent execution
-    _initBackendSocket();
-
-    // 2. Connect to dedicated /voice WebSocket managing PyAudio & Google STT
-    _initVoiceSession();
+    backend.connect(onMessage: _handleBackendMessage, onError: _handleBackendError);
+    _refreshDashboard();
+    clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => localNow = DateTime.now());
+    });
+    dashboardTimer = Timer.periodic(const Duration(seconds: 20), (_) => _refreshDashboard());
   }
 
-  void _initBackendSocket() {
-    backend.connect(
-      onMessage: (message) {
-        if (!mounted) return;
-        if (message['type'] == 'backend_ready') {
-          final online = message['internet'] == true;
-          setState(() {
-            mode = online ? 'ONLINE' : 'OFFLINE';
-            if (status == 'در حال اتصال به سرور...') {
-              status = 'متصل به سرور • در انتظار میکروفون...';
-            }
-          });
-          _log('Backend connected • internet=$online • provider=google_stt');
-        }
-      },
-      onError: (error) {
-        _log('Backend error: $error');
-        if (mounted) {
-          setState(() => status = 'سرور پایتون در دسترس نیست. تلاش مجدد...');
-          Future.delayed(const Duration(seconds: 3), () {
-            if (mounted && !shuttingDown) {
-              _initBackendSocket();
-            }
-          });
-        }
-      },
-    );
-  }
-
-  void _initVoiceSession() {
-    voiceClient.connect(
-      onEvent: _onVoiceEvent,
-      onError: (err) {
-        _log('Voice connection error: $err');
-        if (mounted) {
-          setState(() => status = 'در حال تلاش برای اتصال صوتی...');
-        }
-        // Attempt reconnect after brief delay
-        Future.delayed(const Duration(seconds: 3), () {
-          if (mounted && !shuttingDown && !voiceClient.isConnected) {
-            _initVoiceSession();
-          }
-        });
-      },
-      onDone: () {
-        _log('Voice session closed');
-        if (mounted) {
-          setState(() => status = 'ارتباط صوتی قطع شد. تلاش مجدد...');
-        }
-        Future.delayed(const Duration(seconds: 3), () {
-          if (mounted && !shuttingDown && !voiceClient.isConnected) {
-            _initVoiceSession();
-          }
-        });
-      },
-    );
-  }
-
-  void _onVoiceEvent(Map<String, dynamic> event) {
-    if (!mounted || shuttingDown) return;
-    final type = event['type']?.toString();
-
+  void _handleBackendMessage(Map<String, dynamic> message) {
+    if (!mounted) return;
+    final type = message['type']?.toString();
     switch (type) {
-      case 'voice_ready':
-        _log('Microphone initialized');
-        final pyaudioAvailable = event['pyaudio_available'] != false;
-        if (!pyaudioAvailable) {
-          _log('PyAudio is not available on Python backend');
-          setState(() {
-            status = 'خطا: PyAudio در پایتون نصب نیست';
-          });
-          break;
-        }
-
-        final currentMode = event['mode']?.toString() ?? 'idle';
-        if (currentMode == 'wake') {
-          _log('Listening for wake word');
-          setState(() {
-            visualState = SmartisVisualState.listening;
-            status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
-          });
-        } else {
-          // If session is idle or newly connected, start wake listening
-          _log('Starting wake listening...');
-          setState(() {
-            visualState = SmartisVisualState.listening;
-            status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
-          });
-          _startWakeListening();
-        }
-        break;
-
-      case 'calibrating':
-        final dur = event['duration'] ?? 0.7;
-        final thresh = event['energy_threshold'];
-        final threshInfo = thresh != null ? ' (threshold: $thresh)' : '';
-        _log('Calibration complete ($dur s)$threshInfo');
-        setState(() => status = 'کالیبراسیون صدای محیط...');
-        break;
-
-      case 'listening':
-        final currentMode = event['mode']?.toString() ?? 'wake';
-        if (currentMode == 'wake') {
-          _log('Listening for wake word');
-          setState(() {
-            visualState = SmartisVisualState.listening;
-            status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
-            transcript = 'بگو «اسمارتیز» یا «سعید»';
-          });
-        } else if (currentMode == 'command') {
-          _log('Listening for command');
-          setState(() {
-            visualState = SmartisVisualState.listening;
-            status = 'گوش می‌دهم... دستور خود را بگویید';
-            transcript = 'صحبت کن...';
-          });
-        }
-        break;
-
-      case 'speech_captured':
-        _log('Voice captured, processing STT...');
+      case 'backend_ready':
+        final internet = message['internet'] == true;
+        final mic = Map<String, dynamic>.from(message['microphone'] as Map? ?? const {});
+        final ready = mic['running'] == true;
         setState(() {
-          visualState = SmartisVisualState.thinking;
-          status = 'در حال پردازش گفتار...';
+          mode = internet ? 'ONLINE TTS' : 'OFFLINE';
+          status = ready ? 'گوش می‌دهم...' : 'میکروفون آماده نیست';
+          visualState = ready ? SmartisVisualState.listening : SmartisVisualState.idle;
+          transcript = ready ? 'فرمان بده...' : 'میکروفون را بررسی کن';
         });
+        _log('Backend ready • mic=$ready • device=${mic['device'] ?? 'unknown'}');
         break;
-
-      case 'transcript':
-        final text = event['text']?.toString() ?? '';
-        final prov = event['provider']?.toString() ?? 'google';
-        if (text.isNotEmpty) {
-          _log('STT captured: "$text" ($prov)');
+      case 'mic_ready':
+        setState(() { visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; transcript = 'فرمان بده...'; });
+        break;
+      case 'mic_error':
+        setState(() { visualState = SmartisVisualState.idle; status = 'خطای میکروفون'; });
+        _log('Microphone error • ${message['error'] ?? 'unknown'}');
+        break;
+      case 'mic_state':
+        final state = message['state']?.toString() ?? '';
+        if (state == 'listening' && !processing) {
+          setState(() { visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; });
+        } else if (state == 'stopped') {
+          setState(() { visualState = SmartisVisualState.idle; status = 'میکروفون متوقف است'; });
         }
         break;
-
-      case 'wake_detected':
-        _onWakeDetected(event);
+      case 'mic_level':
+        final raw = message['level'];
+        final level = raw is num ? raw.toDouble().clamp(0.0, 1.0).toDouble() : 0.0;
+        if (mounted) setState(() => audioLevel = level);
         break;
-
-      case 'wake_miss':
-        final heard = event['text']?.toString() ?? '';
-        if (heard.isNotEmpty) {
-          _log('Heard: "$heard" (wake word not matched)');
-        }
-        setState(() {
-          visualState = SmartisVisualState.listening;
-          status = 'در حال شنیدن... بگو «اسمارتیز» یا «سعید»';
-        });
-        break;
-
-      case 'command_final':
-        _onCommandFinal(event);
-        break;
-
-      case 'recognition_error':
-        final err = event['error']?.toString() ?? '';
-        _log('Recognition notice: $err');
-        // If command timed out or had error, cycle back to wake
-        if (!processing) {
-          Future.delayed(const Duration(milliseconds: 500), () {
-            if (mounted && !shuttingDown) _startWakeListening();
-          });
-        }
-        break;
-
-      case 'voice_error':
-        _log('Voice error: ${event['error']}');
-        break;
-
-      case 'voice_fatal':
-        final errMsg = event['error']?.toString() ?? '';
-        _log('Voice fatal: $errMsg');
-        setState(() => status = 'میکروفون در دسترس نیست');
-        break;
-
-      case 'voice_stopped':
+      case 'command_result': unawaited(_onCommand(message)); break;
+      case 'mic_restarted':
+        final mic = Map<String, dynamic>.from(message['microphone'] as Map? ?? const {});
+        final ready = mic['running'] == true;
+        setState(() { processing = false; visualState = ready ? SmartisVisualState.listening : SmartisVisualState.idle; status = ready ? 'گوش می‌دهم...' : 'میکروفون آماده نیست'; });
         break;
     }
+  }
+
+  void _handleBackendError(Object error) {
+    _log('Backend connection • $error');
+    if (mounted) setState(() { status = 'در حال اتصال دوباره به Backend...'; visualState = SmartisVisualState.idle; });
   }
 
   void _log(String message) {
     if (!mounted) return;
-    final now = DateTime.now();
-    final stamp =
-        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
-    setState(() {
-      logs.add('[$stamp] $message');
-      if (logs.length > 150) {
-        logs.removeRange(0, logs.length - 150);
-      }
-    });
+    final n = DateTime.now();
+    final stamp = '${n.hour.toString().padLeft(2,'0')}:${n.minute.toString().padLeft(2,'0')}:${n.second.toString().padLeft(2,'0')}';
+    setState(() { logs.add('[$stamp] $message'); if (logs.length > 120) logs.removeRange(0, logs.length - 120); });
   }
 
-  void _startWakeListening() {
-    if (!mounted || shuttingDown || processing) return;
-    voiceClient.startWake(language: detectedLanguage);
-  }
-
-  Future<void> _onWakeDetected(Map<String, dynamic> event) async {
-    if (!mounted || shuttingDown || processing) return;
-
-    final wakeWord = (event['wake_word'] ?? event['text'] ?? 'اسمارتیز').toString();
-    _log('Wake detected: $wakeWord');
-    final language = (event['language'] ?? 'fa').toString();
-    detectedLanguage = language;
-    final reply = language == 'fa' ? 'جانم' : "Yes, I'm listening.";
-
-    setState(() {
-      visualState = SmartisVisualState.speaking;
-      status = reply;
-      transcript = wakeWord;
-      mode = event['offline'] == true ? 'OFFLINE' : 'ONLINE';
-    });
-
-    _log('TTS: $reply');
-    await _speak(reply, language);
-
-    if (!mounted || shuttingDown) return;
-
-    // Small delay to clear speaker audio before microphone opens for command
-    await Future.delayed(const Duration(milliseconds: 280));
-
-    if (!mounted || shuttingDown) return;
-
-    // Start command session on backend PyAudio
-    _log('Listening for command');
-    voiceClient.startCommand(language: detectedLanguage);
-  }
-
-  Future<void> _onCommandFinal(Map<String, dynamic> event) async {
-    if (!mounted || shuttingDown) return;
-
-    final commandText = (event['text'] ?? '').toString().trim();
-    final language = (event['language'] ?? detectedLanguage).toString();
-    final isOffline = event['offline'] == true;
-
-    _log('Google STT: $commandText');
-
-    setState(() {
-      transcript = commandText.isEmpty ? 'دستوری دریافت نشد' : commandText;
-      detectedLanguage = language;
-      mode = isOffline ? 'OFFLINE' : 'ONLINE';
-      visualState = SmartisVisualState.thinking;
-      status = 'در حال تحلیل دستور...';
-    });
-
-    if (commandText.isNotEmpty) {
-      await _executeCommand(commandText, language);
-    } else {
-      _startWakeListening();
-    }
-  }
-
-  Future<void> _executeCommand(String text, String language) async {
-    if (processing) return;
-    processing = true;
-
-    final overallStart = DateTime.now();
-
+  Future<void> _refreshDashboard() async {
+    if (loadingDashboard || !mounted) return;
+    loadingDashboard = true;
     try {
-      // 1. Agent planning (Fast Path or LLM)
-      final planStart = DateTime.now();
-      final response = await backend.plan(text, language);
-      final planTime = DateTime.now().difference(planStart).inMilliseconds;
+      final result = await backend.dashboard();
+      if (!mounted || result['ok'] != true) return;
+      final voices = Map<String, dynamic>.from(result['voices'] as Map? ?? const {});
+      setState(() {
+        dashboard = result;
+        final fa = Map<String, dynamic>.from(voices['fa'] as Map? ?? const {});
+        final en = Map<String, dynamic>.from(voices['en'] as Map? ?? const {});
+        faGender = (fa['key']?.toString() ?? 'fa_female').endsWith('female') ? 'female' : 'male';
+        enGender = (en['key']?.toString() ?? 'en_male').endsWith('female') ? 'female' : 'male';
+      });
+    } catch (e) { _log('Dashboard • $e'); }
+    finally { loadingDashboard = false; }
+  }
 
-      if (response['ok'] != true) {
-        setState(() => status = 'خطا در برنامه‌ریزی: ${response['error'] ?? ''}');
-        _startWakeListening();
+  Future<void> _changeVoice(String language, String gender) async {
+    try {
+      final r = await backend.setVoice(language, gender);
+      if (r['ok'] == true && mounted) {
+        setState(() { if (language == 'fa') faGender = gender; else enGender = gender; });
+        _log('Voice • $language/${gender == 'female' ? 'female' : 'male'}');
+      }
+    } catch (e) { _log('Voice settings • $e'); }
+  }
+
+  Future<void> _onCommand(Map<String, dynamic> result) async {
+    if (!mounted || shuttingDown) return;
+    try {
+      if (result['ok'] != true) {
+        setState(() { processing = false; status = 'خطا در تشخیص گفتار'; audioLevel = 0; });
+        _log('STT failed • ${result['error'] ?? 'unknown'}');
         return;
       }
-
-      final isFastPath = response['provider'] == 'fast-path';
-      if (isFastPath) {
-        _log('Fast Path matched');
-      } else {
-        _log('Agent planned in ${planTime}ms');
-      }
-
-      final plan = Map<String, dynamic>.from(response['plan'] ?? {});
-
-      if (plan['needs_confirmation'] == true) {
-        setState(() => status = 'این عملیات نیاز به تأیید دارد');
-        await _speak(
-          language == 'fa'
-              ? 'برای این عملیات تأیید شما لازم است.'
-              : 'I need your confirmation for this action.',
-          language,
-        );
+      if (result['ignored'] == true) {
+        processing = false;
+        _log('STT noise-gate • ignored');
         return;
       }
-
-      // 2. Tool Execution
-      final toolStart = DateTime.now();
-      final actions = (plan['actions'] as List?) ?? [];
-      for (final act in actions) {
-        if (act is Map) {
-          final tool = act['tool']?.toString();
-          final args = act['args'];
-          if (tool == 'open_application') {
-            _log('Opening ${args?['app'] ?? 'application'}');
-          } else if (tool == 'open_website') {
-            _log('Opening website ${args?['url'] ?? ''}');
-          }
-        }
-      }
-
-      final execution = await backend.execute(plan);
-      final toolTime = DateTime.now().difference(toolStart).inMilliseconds;
-
-      if (execution['needs_confirmation'] == true) {
-        setState(() => status = 'تأیید لازم است');
-        await _speak(
-          language == 'fa'
-              ? 'برای این عملیات تأیید شما لازم است.'
-              : 'I need your confirmation for this action.',
-          language,
-        );
-        return;
-      }
-
-      _log('Command complete');
-
-      // 3. TTS Response
-      final reply = (plan['reply'] ?? '').toString();
-      final ttsStart = DateTime.now();
-
-      if (execution['ok'] == true) {
-        setState(() => status = 'انجام شد');
-        final results = (execution['results'] as List?) ?? const [];
-        final spokenChunks = <String>[];
-
-        for (final item in results) {
-          if (item is Map) {
-            final itemResult = item['result'];
-            if (itemResult is Map) {
-              final spoken = (itemResult['speak'] ?? '').toString().trim();
-              if (spoken.isNotEmpty) spokenChunks.add(spoken);
-            }
-          }
-        }
-
-        if (spokenChunks.isNotEmpty) {
-          await _speak(spokenChunks.join('. '), language);
-        } else if (reply.isNotEmpty) {
-          await _speak(reply, language);
-        }
-      } else {
-        setState(() => status = 'خطا در اجرا');
-        await _speak(
-          language == 'fa'
-              ? 'در اجرای درخواست مشکلی پیش آمد.'
-              : 'There was a problem executing the request.',
-          language,
-        );
-      }
-
-      final ttsTime = DateTime.now().difference(ttsStart).inMilliseconds;
-      final totalTime = DateTime.now().difference(overallStart).inMilliseconds;
-
-      _log(
-        'STT: Google | Agent: ${planTime}ms | Tool: ${toolTime}ms | TTS: ${ttsTime}ms | Total: ${totalTime}ms',
-      );
-    } catch (error) {
-      _log('Execution error: $error');
-      if (mounted) setState(() => status = 'خطا: $error');
+      final text = (result['text'] ?? '').toString().trim();
+      final language = (result['language'] ?? '').toString().trim();
+      setState(() { transcript = text.isEmpty ? 'صدایی تشخیص داده نشد' : text; detectedLanguage = language; mode = result['offline'] == true ? 'OFFLINE STT' : 'ONLINE'; visualState = SmartisVisualState.thinking; status = text.isEmpty ? 'صدایی تشخیص داده نشد' : 'در حال اجرا...'; audioLevel = 0; });
+      _log('STT • lang=$language • text=${text.isEmpty ? '<empty>' : text}');
+      if (text.isNotEmpty) { processing = true; await _runAgent(text, language.isEmpty ? null : language); processing = false; }
     } finally {
+      if (!mounted || shuttingDown) return;
       processing = false;
-      if (mounted && !shuttingDown) {
-        setState(() {
-          visualState = SmartisVisualState.idle;
-          audioLevel = 0.0;
-        });
-        // Loop back to wake listening smoothly
-        Future.delayed(const Duration(milliseconds: 350), () {
-          if (mounted && !shuttingDown) {
-            _startWakeListening();
-          }
-        });
-      }
+      backend.resumeListening();
+      setState(() { visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; audioLevel = 0; });
     }
+  }
+
+  Future<void> _runAgent(String text, String? language) async {
+    try {
+      final started = DateTime.now();
+      final response = await backend.command(text, language);
+      _log('Execute • ${DateTime.now().difference(started).inMilliseconds}ms • ${response['provider'] ?? 'unknown'}');
+      if (response['ok'] != true) { await _speak(language == 'fa' ? 'در اجرای درخواست مشکلی پیش آمد.' : 'I could not execute that request.', language); return; }
+      final plan = Map<String, dynamic>.from(response['plan'] as Map? ?? {});
+      final execution = Map<String, dynamic>.from(response['execution'] as Map? ?? {});
+      if (execution['needs_confirmation'] == true || plan['needs_confirmation'] == true) {
+        setState(() => status = 'منتظر تأیید...');
+        final q = (plan['reply'] ?? (language == 'fa' ? 'تأیید می‌کنی؟' : 'Please confirm.')).toString();
+        await _speak(q, language);
+        return;
+      }
+      final results = (execution['results'] as List?) ?? const [];
+      if (execution['ok'] != true) {
+        String detail='';
+        for (final item in results) {
+          if (item is Map && item['result'] is Map) {
+            final x=Map<String,dynamic>.from(item['result'] as Map);
+            detail=(x['speak'] ?? x['error'] ?? '').toString().trim();
+            if (detail.isNotEmpty) break;
+          }
+        }
+        await _speak(detail.isNotEmpty ? detail : (language=='fa' ? 'اجرای دستور با مشکل روبه‌رو شد.' : 'The command could not be completed.'), language);
+        return;
+      }
+      final chunks=<String>[];
+      for (final item in results) { if (item is Map && item['result'] is Map) { final x=Map<String,dynamic>.from(item['result'] as Map); final t=(x['speak']??'').toString().trim(); if(t.isNotEmpty) chunks.add(t); } }
+      final reply=(plan['reply']??'').toString().trim();
+      final spoken=chunks.isNotEmpty?chunks.join('. '):reply;
+      if (spoken.isNotEmpty) await _speak(spoken, language);
+      if (mounted) setState(() => status = 'انجام شد');
+    } catch (e) { _log('Command • $e'); await _speak(language == 'fa' ? 'در اجرای درخواست مشکلی پیش آمد.' : 'I could not execute that request.', language); }
   }
 
   Future<void> _speak(String text, String? language) async {
-    if (!mounted) return;
-
-    setState(() {
-      visualState = SmartisVisualState.speaking;
-      audioLevel = 0.0;
-    });
-
-    final result = await backend.speak(text, language);
-    if (result['ok'] != true) {
-      if (mounted) {
-        setState(() => status = 'خطا در TTS: ${result['error'] ?? ''}');
-      }
-      return;
-    }
-
-    final encoded = result['audio_base64']?.toString();
-    if (encoded != null && encoded.isNotEmpty) {
-      await player.play(
-        BytesSource(
-          base64Decode(encoded),
-          mimeType: result['mime_type']?.toString(),
-        ),
-      );
+    if (!mounted || text.trim().isEmpty) return;
+    setState(() { visualState = SmartisVisualState.speaking; status = 'دارم صحبت می‌کنم...'; audioLevel = 0; });
+    final result=await backend.speak(text, language);
+    final encoded=result['audio_base64']?.toString();
+    if (encoded!=null && encoded.isNotEmpty) {
+      try { final completion=player.onPlayerComplete.first.timeout(const Duration(seconds:30)); await player.play(BytesSource(base64Decode(encoded),mimeType:result['mime_type']?.toString())); try{await completion;}catch(_){} } catch(e){ _log('TTS playback • $e'); }
     }
   }
 
   @override
-  void dispose() {
-    shuttingDown = true;
-    voiceClient.dispose();
-    player.dispose();
-    backend.dispose();
-    super.dispose();
-  }
-
-  String _stateText() {
-    switch (visualState) {
-      case SmartisVisualState.idle:
-        return 'بگو «اسمارتیز» یا «سعید»';
-      case SmartisVisualState.listening:
-        return 'گوش می‌دهم...';
-      case SmartisVisualState.thinking:
-        return 'دارم فکر می‌کنم...';
-      case SmartisVisualState.speaking:
-        return 'دارم صحبت می‌کنم...';
-    }
-  }
+  void dispose(){ shuttingDown=true; clockTimer?.cancel(); dashboardTimer?.cancel(); player.dispose(); backend.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
+    final weather = Map<String, dynamic>.from(dashboard['weather'] as Map? ?? const {});
+    final location = Map<String, dynamic>.from(dashboard['location'] as Map? ?? const {});
+    final timeDate = Map<String, dynamic>.from(dashboard['time_date'] as Map? ?? const {});
+    final cpu = dashboard['cpu_percent'];
+    final ram = dashboard['ram_percent'];
+    final smartCpu = dashboard['smartis_cpu_percent'];
+    final smartRam = dashboard['smartis_memory_mb'];
+    final cpuTemp = dashboard['cpu_temp_c'];
+    final ramTemp = dashboard['ram_temp_c'];
+    final dateFa = (timeDate['date_fa'] ?? '').toString();
+    final weatherText = (weather['message'] ?? '').toString();
+    final locationOff = weather['location_required'] == true ||
+        (location.isNotEmpty && location['ok'] == false && weather['ok'] != true);
+
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true),
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        useMaterial3: true,
+        scaffoldBackgroundColor: Colors.black,
+        canvasColor: Colors.black,
+        colorScheme: ColorScheme.fromSeed(seedColor: gold, brightness: Brightness.dark),
+      ),
       home: Scaffold(
-        backgroundColor: Colors.transparent,
+        backgroundColor: Colors.black,
         body: GestureDetector(
           behavior: HitTestBehavior.translucent,
-          onPanStart: (_) => windowManager.startDragging(),
+          onPanStart: (_) => SmartisWindowsWindow.startDragging(),
           child: SafeArea(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                // Responsively scale Orb so it never overflows 520x610 or any window size,
-                // keeping its majestic, full-sized presence intact.
-                final orbDimension =
-                    (constraints.maxHeight * 0.38).clamp(180.0, 280.0);
-
-                return SingleChildScrollView(
-                  physics: const BouncingScrollPhysics(),
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      minHeight: constraints.maxHeight,
-                    ),
-                    child: IntrinsicHeight(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          // Top bar with close button
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.end,
-                            children: [
-                              IconButton(
-                                tooltip: 'بستن',
-                                onPressed: () => windowManager.close(),
-                                icon: const Icon(
-                                  Icons.close_rounded,
-                                  color: gold,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                            ],
-                          ),
-
-                          // Smartis Orb (unmodified CustomPainter animation)
-                          Center(
-                            child: SizedBox(
-                              width: orbDimension,
-                              height: orbDimension,
-                              child: FittedBox(
-                                fit: BoxFit.contain,
-                                child: SmartisOrb(
-                                  state: visualState,
-                                  level: audioLevel,
-                                ),
+            child: Column(
+              children: [
+                _topBar(),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final compact = constraints.maxWidth < 1050;
+                        if (compact) {
+                          return _compactLayout(
+                            timeDate, dateFa, weatherText, weather, location,
+                            locationOff, cpu, ram, cpuTemp, ramTemp, smartCpu, smartRam,
+                          );
+                        }
+                        return Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            SizedBox(width: 300, child: _logsPanel()),
+                            const SizedBox(width: 18),
+                            Expanded(child: _orbPanel()),
+                            const SizedBox(width: 18),
+                            SizedBox(
+                              width: 360,
+                              child: _rightPanel(
+                                timeDate, dateFa, weatherText, weather, location,
+                                locationOff, cpu, ram, cpuTemp, ramTemp, smartCpu, smartRam,
                               ),
                             ),
-                          ),
-
-                          const SizedBox(height: 6),
-                          const Text(
-                            'S M A R T I S',
-                            style: TextStyle(
-                              fontSize: 22,
-                              letterSpacing: 8,
-                              fontWeight: FontWeight.w600,
-                              color: gold,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            _stateText(),
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: gold,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 20),
-                            child: Text(
-                              status,
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(.82),
-                                fontSize: 13,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Text(
-                                'حالت: $mode',
-                                style: TextStyle(
-                                  color: gold.withOpacity(.76),
-                                  fontSize: 11,
-                                  letterSpacing: 1,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Text(
-                                detectedLanguage == 'fa' ? 'فارسی' : 'English',
-                                style: TextStyle(
-                                  color: gold.withOpacity(.9),
-                                  fontSize: 11,
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-
-                          // Transcript box
-                          Container(
-                            margin: const EdgeInsets.symmetric(horizontal: 36),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 10,
-                            ),
-                            decoration: BoxDecoration(
-                              border: Border.all(
-                                color: gold.withOpacity(.24),
-                              ),
-                              borderRadius: BorderRadius.circular(16),
-                              color: Colors.black.withOpacity(.24),
-                            ),
-                            child: Text(
-                              transcript,
-                              textAlign: TextAlign.center,
-                              textDirection: TextDirection.rtl,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 14),
-                            ),
-                          ),
-
-                          const SizedBox(height: 8),
-
-                          // Real-time Live Log panel
-                          SmartisLogPanel(entries: logs),
-
-                          const SizedBox(height: 6),
-                          Text(
-                            'Smartis • Google SpeechRecognition + PyAudio • Windows',
-                            style: TextStyle(
-                              fontSize: 9.5,
-                              color: gold.withOpacity(.58),
-                              letterSpacing: .5,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                        ],
-                      ),
+                          ],
+                        );
+                      },
                     ),
                   ),
-                );
-              },
+                ),
+              ],
             ),
           ),
         ),
       ),
     );
   }
+
+  Widget _topBar() => Padding(
+        padding: const EdgeInsets.fromLTRB(22, 10, 22, 10),
+        child: Row(
+          children: [
+            const Icon(Icons.auto_awesome, color: gold, size: 20),
+            const SizedBox(width: 9),
+            const Text('SMARTIS', style: TextStyle(color: gold, fontWeight: FontWeight.w800, letterSpacing: 2.4)),
+            const SizedBox(width: 14),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(color: const Color(0xFF101010), borderRadius: BorderRadius.circular(20), border: Border.all(color: gold.withOpacity(.12))),
+              child: Text(mode, style: const TextStyle(color: Colors.white54, fontSize: 10, letterSpacing: .8)),
+            ),
+            const Spacer(),
+            IconButton(tooltip: 'بازنشانی میکروفون', onPressed: backend.restartMicrophone, icon: const Icon(Icons.mic_none_rounded, color: gold)),
+            IconButton(tooltip: 'بستن', onPressed: SmartisWindowsWindow.close, icon: const Icon(Icons.close_rounded, color: Colors.white54)),
+          ],
+        ),
+      );
+
+  Widget _orbPanel() => Container(
+        decoration: _box().copyWith(borderRadius: BorderRadius.circular(26)),
+        child: Stack(
+          children: [
+            Positioned(top: 22, left: 22, child: _hudLabel('SMARTIS CORE')),
+            Positioned(top: 22, right: 22, child: _hudLabel(detectedLanguage.isEmpty ? 'AUTO' : detectedLanguage.toUpperCase())),
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  FittedBox(fit: BoxFit.contain, child: SmartisOrb(state: visualState, level: audioLevel)),
+                  const SizedBox(height: 28),
+                  Text(status, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 620),
+                    child: Text(transcript, maxLines: 3, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54, fontSize: 14, height: 1.5)),
+                  ),
+                ],
+              ),
+            ),
+            Positioned(left: 22, right: 22, bottom: 20, child: Row(children: [
+              _statusDot(visualState == SmartisVisualState.listening),
+              const SizedBox(width: 8),
+              Text(visualState == SmartisVisualState.listening ? 'LISTENING' : visualState.name.toUpperCase(), style: const TextStyle(color: Colors.white38, fontSize: 10, letterSpacing: 1.2)),
+              const Spacer(),
+              Text(_clock(localNow), style: const TextStyle(color: gold, fontSize: 13, fontWeight: FontWeight.w700)),
+            ])),
+          ],
+        ),
+      );
+
+  Widget _rightPanel(Map<String, dynamic> td, String dateFa, String weatherText, Map<String, dynamic> weather, Map<String, dynamic> location, bool locationOff, dynamic cpu, dynamic ram, dynamic cpuTemp, dynamic ramTemp, dynamic smartCpu, dynamic smartRam) => SingleChildScrollView(
+        physics: const BouncingScrollPhysics(),
+        child: Column(
+          children: [
+            _heroCard(td, dateFa),
+            const SizedBox(height: 12),
+            _weatherCard(weatherText, weather, location, locationOff),
+            const SizedBox(height: 12),
+            _dashboardGrid(cpu, ram, cpuTemp, ramTemp, smartCpu, smartRam),
+            const SizedBox(height: 12),
+            _voiceCard(),
+          ],
+        ),
+      );
+
+  Widget _logsPanel() => Container(
+        decoration: _box().copyWith(borderRadius: BorderRadius.circular(26)),
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [const Icon(Icons.terminal_rounded, color: gold, size: 19), const SizedBox(width: 8), const Text('LIVE LOGS', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800, letterSpacing: 1.2)), const Spacer(), Text('${logs.length}', style: const TextStyle(color: Colors.white24, fontSize: 10))]),
+            const SizedBox(height: 12),
+            Expanded(child: SmartisLogPanel(entries: logs)),
+          ],
+        ),
+      );
+
+  Widget _compactLayout(Map<String, dynamic> td, String dateFa, String weatherText, Map<String, dynamic> weather, Map<String, dynamic> location, bool locationOff, dynamic cpu, dynamic ram, dynamic cpuTemp, dynamic ramTemp, dynamic smartCpu, dynamic smartRam) => SingleChildScrollView(
+        physics: const BouncingScrollPhysics(),
+        child: Column(children: [
+          SizedBox(height: 430, child: _orbPanel()),
+          const SizedBox(height: 14),
+          _rightPanel(td, dateFa, weatherText, weather, location, locationOff, cpu, ram, cpuTemp, ramTemp, smartCpu, smartRam),
+          const SizedBox(height: 14),
+          SizedBox(height: 300, child: _logsPanel()),
+        ]),
+      );
+
+  Widget _hudLabel(String value) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+        decoration: BoxDecoration(color: gold.withOpacity(.06), borderRadius: BorderRadius.circular(20), border: Border.all(color: gold.withOpacity(.12))),
+        child: Text(value, style: const TextStyle(color: Colors.white30, fontSize: 9, letterSpacing: 1.1)),
+      );
+
+  Widget _statusDot(bool active) => Container(width: 7, height: 7, decoration: BoxDecoration(shape: BoxShape.circle, color: active ? gold : Colors.white24, boxShadow: active ? [BoxShadow(color: gold.withOpacity(.45), blurRadius: 8)] : null));
+
+  Widget _heroCard(Map<String,dynamic> td, String dateFa) => Container(width:double.infinity,padding:const EdgeInsets.all(18),decoration:_box(),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    Row(children:[const Icon(Icons.schedule_rounded,color:gold,size:22),const SizedBox(width:10),Expanded(child:Text(_clock(localNow),style:const TextStyle(color:Colors.white,fontSize:30,fontWeight:FontWeight.w700,letterSpacing:1.1)))]),
+    const SizedBox(height:8),
+    Row(children:[const Icon(Icons.calendar_month_rounded,color:gold,size:17),const SizedBox(width:8),Expanded(child:Text(dateFa.isNotEmpty?dateFa:'تاریخ در حال دریافت...',style:const TextStyle(color:Colors.white70,fontSize:13)))]),
+    const SizedBox(height:8),
+    Text('فرمان‌ها را مستقیم می‌شنوم؛ گفتن «اسمارتیز» اختیاری است.',style:TextStyle(color:gold.withOpacity(.82),fontSize:10)),
+  ]));
+
+  Widget _dashboardGrid(dynamic cpu,dynamic ram,dynamic cpuTemp,dynamic ramTemp,dynamic smartCpu,dynamic smartRam)=>GridView.count(crossAxisCount:2,shrinkWrap:true,physics:const NeverScrollableScrollPhysics(),crossAxisSpacing:8,mainAxisSpacing:8,childAspectRatio:1.65,children:[
+    _metric(Icons.memory_rounded,'CPU',cpu==null?'--':'${cpu}%'),
+    _metric(Icons.device_thermostat_rounded,'دمای CPU',cpuTemp==null?'--':'${cpuTemp}°C'),
+    _metric(Icons.storage_rounded,'RAM',ram==null?'--':'${ram}%'),
+    _metric(Icons.thermostat_rounded,'دمای RAM',ramTemp==null?'--':'${ramTemp}°C'),
+    _metric(Icons.bolt_rounded,'CPU Smartis',smartCpu==null?'--':'${smartCpu}%'),
+    _metric(Icons.memory_rounded,'RAM Smartis',smartRam==null?'--':'${smartRam} MB'),
+  ]);
+
+  Widget _weatherCard(String text,Map<String,dynamic> weather,Map<String,dynamic> location,bool off)=>Container(width:double.infinity,padding:const EdgeInsets.all(15),decoration:_box(),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    Row(children:[const Icon(Icons.cloud_rounded,color:gold),const SizedBox(width:8),const Text('آب‌وهوا',style:TextStyle(color:Colors.white,fontWeight:FontWeight.bold)),const Spacer(),IconButton(onPressed:off?SmartisWindowsWindow.openLocationSettings:null,tooltip:'مکان ویندوز',icon:Icon(off?Icons.location_disabled:Icons.location_on,color:off?Colors.redAccent:gold))]),
+    const SizedBox(height:4),
+    Text(off?'مکان ویندوز در دسترس نیست؛ می‌توانی شهر را مستقیم از Smartis بپرسی.':(text.isNotEmpty?text:'آب‌وهوا در حال دریافت است...'),style:const TextStyle(color:Colors.white70,fontSize:13,height:1.5)),
+    if(!off)Padding(padding:const EdgeInsets.only(top:7),child:Text('${weather['city']??location['city']??''}  •  ${weather['humidity']??'--'}% رطوبت  •  ${weather['wind_kmh']??'--'} km/h باد',style:const TextStyle(color:Colors.white38,fontSize:10))),
+  ]));
+
+  Widget _voiceCard() => Container(width:double.infinity,padding:const EdgeInsets.all(15),decoration:_box(),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    const Row(children:[Icon(Icons.record_voice_over_rounded,color:gold),SizedBox(width:8),Text('صدای Smartis',style:TextStyle(color:Colors.white,fontWeight:FontWeight.bold))]),
+    const SizedBox(height:10),
+    Row(children:[Expanded(child:_voiceDropdown('فارسی',faGender,(v)=>_changeVoice('fa',v))),const SizedBox(width:8),Expanded(child:_voiceDropdown('English',enGender,(v)=>_changeVoice('en',v)))]),
+  ]));
+
+  Widget _voiceDropdown(String label,String value,ValueChanged<String> onChanged)=>InputDecorator(decoration:InputDecoration(labelText:label,labelStyle:const TextStyle(color:Colors.white54),filled:true,fillColor:const Color(0xFF101010),border:OutlineInputBorder(borderRadius:BorderRadius.all(Radius.circular(12)),borderSide:BorderSide(color:Color(0x22FFD700))),enabledBorder:OutlineInputBorder(borderRadius:BorderRadius.all(Radius.circular(12)),borderSide:BorderSide(color:Color(0x22FFD700)))),child:DropdownButtonHideUnderline(child:DropdownButton<String>(isExpanded:true,value:value,dropdownColor:const Color(0xFF151515),items:const [DropdownMenuItem(value:'female',child:Text('زن / Female')),DropdownMenuItem(value:'male',child:Text('مرد / Male'))],onChanged:(v){if(v!=null)onChanged(v);})));
+  BoxDecoration _box()=>BoxDecoration(color:const Color(0xFF080808),borderRadius:BorderRadius.circular(18),border:Border.all(color:gold.withOpacity(.14)));
+  Widget _metric(IconData icon,String title,String value)=>Container(padding:const EdgeInsets.all(10),decoration:_box(),child:Row(children:[Icon(icon,color:gold,size:18),const SizedBox(width:7),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisAlignment:MainAxisAlignment.center,children:[Text(title,style:const TextStyle(color:Colors.white54,fontSize:9),maxLines:1,overflow:TextOverflow.ellipsis),const SizedBox(height:2),Text(value,style:const TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:13))]))]));
+  String _clock(DateTime x)=>'${x.hour.toString().padLeft(2,'0')}:${x.minute.toString().padLeft(2,'0')}:${x.second.toString().padLeft(2,'0')}';
 }

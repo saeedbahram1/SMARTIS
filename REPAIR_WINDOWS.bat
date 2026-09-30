@@ -1,44 +1,58 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0frontend"
-
-echo ==================================================
-echo         SMARTIS - WINDOWS BUILD REPAIR
-echo ==================================================
-
-echo [1/4] Stopping any running Smartis processes...
-taskkill /F /IM smartis_assistant.exe >nul 2>&1
-
-echo [2/4] Clearing build and cache directories...
-if exist "build" rmdir /s /q "build" >nul 2>&1
-if exist ".dart_tool" rmdir /s /q ".dart_tool" >nul 2>&1
-if exist "windows\flutter\ephemeral" rmdir /s /q "windows\flutter\ephemeral" >nul 2>&1
-
-echo [3/4] Ensuring Windows CMake platform files exist...
-if not exist "windows\CMakeLists.txt" (
-    flutter create --platforms=windows .
-) else if not exist "windows\runner\Runner.rc" (
-    flutter create --platforms=windows .
-)
-
-echo [4/4] Fetching Flutter dependencies...
-flutter clean
-flutter pub get
-
 if errorlevel 1 goto :error
 
+echo ============================================================
+echo SMARTIS - WINDOWS BUILD REPAIR
+echo ============================================================
+
+echo [1/6] Closing Smartis...
+taskkill /F /IM smartis_desktop.exe >nul 2>&1
+
+if not exist "windows\CMakeLists.txt" goto :regenerate
+if not exist "windows\flutter\CMakeLists.txt" goto :regenerate
+goto :project_ready
+
+:regenerate
+echo [2/6] Regenerating the Windows platform files...
+call flutter create --platforms=windows .
+if errorlevel 1 goto :error
+
+:project_ready
+echo [3/6] Cleaning Flutter build artifacts...
+call flutter clean
+if errorlevel 1 goto :error
+
+echo [4/6] Restoring Flutter packages and generated Windows files...
+call flutter pub get
+if errorlevel 1 goto :error
+
+if not exist "windows\flutter\CMakeLists.txt" (
+    echo ERROR: windows\flutter\CMakeLists.txt is still missing.
+    goto :error
+)
+
+if not exist "windows\flutter\generated_plugins.cmake" (
+    echo ERROR: flutter pub get did not generate generated_plugins.cmake.
+    goto :error
+)
+
+echo [5/6] Building Windows application...
+call flutter build windows
+if errorlevel 1 goto :error
+
+echo [6/6] Repair verification complete.
 echo.
-echo ==================================================
-echo [SUCCESS] Windows build state is repaired cleanly.
-echo You can now launch the app using: run_frontend.bat
-echo ==================================================
+echo Windows build repair completed successfully.
+echo You can now run: run_frontend.bat
 pause
+endlocal
 exit /b 0
 
 :error
 echo.
-echo [ERROR] Repair encountered an issue. Please verify:
-echo 1. Flutter is installed and in PATH (flutter doctor).
-echo 2. Visual Studio "Desktop development with C++" workload is installed.
+echo Repair failed. Check the Flutter output above.
+echo Required tooling: Flutter Windows desktop support + Visual Studio Desktop C++.
 pause
-exit /b 1
+endlocal & exit /b 1

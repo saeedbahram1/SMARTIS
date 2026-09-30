@@ -1,118 +1,93 @@
-# Smartis — دستیار صوتی هوشمند (Smart Voice Assistant)
+# Smartis — Direct Listening / Jarvis Command Layer
 
-پروژه **Smartis** یک دستیار صوتی دسکتاپ مدرن و هیبریدی برای ویندوز است که با **Flutter Desktop** (رابط کاربری HUD با تم طلایی JARVIS) و **Python FastAPI Backend** ساخته شده است.
+This package contains the current Smartis Windows desktop project.
 
----
+## What changed in Stage 16
 
-## معماری صوتی و پردازش گفتار
+1. **No wake word.** Smartis listens continuously for commands. `Smartis` / `اسمارتیز` is optional and is removed only when it appears at the beginning of a command.
+2. **Stable microphone path.** The Python backend owns one continuous `sounddevice` stream. Flutter does not start/stop a Windows recorder for every command.
+3. **WebSocket JSON is hardened.** NumPy scalars/arrays are converted before transmission and WebSocket event frames are sent as pre-encoded JSON text, preventing the `Object of type bool is not JSON serializable` crash seen in the previous build.
+4. **Separate system vs player audio.** `صدا 20 درصد` targets Windows master volume. `صدای آهنگ 150 درصد` targets the active player's own volume and will not silently fall back to Windows volume when the player cannot expose that range.
+5. **Media transport controls.** Next, previous, play/pause and stop use Windows media transport keys, so they can control the active compatible player without requiring Smartis to know the exact app first.
+6. **Player volume above 100%.** Smartis first checks the active player's exposed UI slider. If the player exposes a range above 100%, that range is used; otherwise Smartis reports that the requested level is unsupported. VLC documents a configurable maximum volume display in its preferences.
+7. **Natural commands.** Fast-path commands cover common Persian/English requests such as opening Google, changing volume by percentage, muting/unmuting, next/previous, pause/stop, player-specific volume, and playing a requested song/video. Unknown/general commands can still fall through to the local planner when Ollama is available.
+8. **Multi-step examples.** Common combinations such as `برو تو گوگل و آهنگ شایع ترک عصبانی رو پخش کن` are handled directly as two actions.
 
-سیستم پردازش صوتی Smartis دارای ساختار بدون فایل موقت (Zero Disk Overhead) و کنترل مستقیم میکروفون توسط پایتون است:
+## Run
 
-```text
-Windows Microphone
-       ↓
-Python Backend (PyAudio + SpeechRecognition)
-       ↓
-    [Online] ──> Google Web Speech (recognize_google)
-    [Offline] ─> faster-whisper (Fallback محلی)
-       ↓
-Fast Path / Ollama Agent
-       ↓
-TTS (edge-tts / Windows SAPI) ──> پاسخ صوتی
-```
+1. Replace your existing `C:\Project\Smartis` project with the contents of this ZIP.
+2. Run `SETUP_SHERPA_MODELS.bat` once if the speech model folders are not populated.
+3. Start with `START_SMARTIS.bat`, or run `run_backend.bat` and `run_frontend.bat` separately.
+4. The microphone starts listening automatically; there is no wake-word step.
 
-### ۱. تبدیل گفتار به متن آنلاین (Online STT)
-* پیاده‌سازی شده با: **`SpeechRecognition` + `PyAudio` + `recognize_google`**
-* زبان پیش‌فرض فارسی: `fa-IR`
-* زبان پیش‌فرض انگلیسی: `en-US`
-* **توجه مهم:** این سرویس از موتور داخلی Google Web Speech استفاده می‌کند و **با Google Cloud Speech-to-Text یک سرویس یکسان نیست**. بنابراین به هیچ‌گونه Google Cloud API Key یا اعتبارسنجی ابری نیازی ندارد.
-* در حالت آنلاین، هیچ فایل WAV موقتی روی دیسک ذخیره نمی‌شود و جریان بایت‌های صوتی در حافظه رم مستقیماً پردازش می‌گردد.
+## Diagnostics
 
-### ۲. تبدیل گفتار به متن آفلاین (Offline STT Fallback)
-* پیاده‌سازی شده با: **`faster-whisper`** و مدل محلی `backend/models/whisper-small`
-* چنانچه ارتباط اینترنت قطع باشد، یا متد گوگل با خطای شبکه/تایم‌اوت روبه‌رو شود، سیستم بلافاصله و بدون معطلی به Whisper سوییچ می‌کند تا کاربری سیستم هرگز مختل نشود.
+- `TEST_MICROPHONE.bat` checks the Windows input device and raw PCM level.
+- `TEST_COMMAND_ENGINE.bat` checks normalization, the no-wake-word rule, JSON serialization, media commands, volume parsing and the common multi-step example.
+- `REPAIR_WINDOWS.bat` repairs the Flutter Windows project and runs a complete Windows build.
 
-### ۳. تشخیص کلمه بیدارباش (Wake Word)
-* کنترل در پس‌زمینه با نشست صوتی یکپارچه در `backend/services/google_voice.py`.
-* کلمات کلیدی مورد پشتیبانی:
-  * **«اسمارتیز»**، **«اسمارتیس»**، **«اسمارتس»**، **«اسمارتی»**
-  * **«Smartis»**، **«Smarties»**، **«Smart is»**
-* مجهز به سیستم نرمال‌سازی نویسه‌های عربی/فارسی و تطبیق فازی با فاصله لون‌اشتاین (Levenshtein Distance).
-* چرخه پایدار:
-  `Wake Listening` → تشخیص کلمه → پاسخ صوتی **«جانم»** → `Command Listening` → تشخیص دستور با Google → اجرای دستور با Fast Path یا Agent → پاسخ صوتی TTS → بازگشت خودکار به `Wake Listening`.
+## Speech models
 
-### ۴. تبدیل متن به گفتار (TTS)
-* **Online TTS:** سرویس مایکروسافت `edge-tts`
-  * صدای فارسی: `fa-IR-DilaraNeural`
-  * صدای انگلیسی: `en-US-GuyNeural`
-* **Offline TTS:** موتور بومی ویندوز `pyttsx3` / Windows SAPI5 با راه‌اندازی استاندارد ترد COM (`pythoncom.CoInitialize`).
+Run `SETUP_SHERPA_MODELS.bat` once to install Python dependencies and download the required Sherpa-ONNX speech models. Model files are intentionally not included in the ZIP because of their size.
 
-### ۵. مسیر میانبر سریع (Fast Path)
-دستورات پرکاربرد زیر بدون اتلاف وقت و بدون معطلی برای LLM محلی بلافاصله اجرا می‌شوند:
-* **کروم رو باز کن** / Google Chrome
-* **اج رو باز کن** / Microsoft Edge
-* **نوت‌پد رو باز کن** / Notepad
-* **ماشین حساب رو باز کن** / Calculator
-* **فایل اکسپلورر رو باز کن** / File Explorer
-* **گوگل رو باز کن** / Google
-* **یوتیوب رو باز کن** / YouTube
-* **چت جی پی تی رو باز کن** / ChatGPT
-* **کلود رو باز کن** / Claude
+## Windows shell
 
-### ۶. ارتباط Flutter و Backend
-* ارتباط صوتی از طریق کانال اختصاصی وب‌سوکت `ws://127.0.0.1:8765/voice` صورت می‌گیرد.
-* فلاتر دیگر نیازی به ضبط فایل WAV روی دیسک ندارد و بسته‌های بلااستفاده صوتی حذف شده‌اند.
-* رابط کاربری بدون قاب، شفاف، با قابلیت کشیدن با ماوس و مجهز به ویجت انیمیشنی `SmartisOrb` (طلایی `#FFD700`) بدون هیچ‌گونه خطای RenderFlex Overflow است.
+Smartis uses a native Windows MethodChannel for its small set of window operations; `window_manager` and `screen_retriever` are intentionally not dependencies.
 
----
 
-## پیش‌نیازها و نصب
+## Stage 16 رفتار صوتی
+- Listening مستقیم بدون Wake Word
+- فارسی اولویت اول؛ English فقط وقتی نتیجه فارسی معتبر نباشد
+- endpoint سریع‌تر (~0.58s سکوت)
+- فرمان‌های fast-path در یک round-trip اجرا می‌شوند؛ TTS فقط بعد از اجرای action انجام می‌شود
+- مسیر Ollama فقط برای فرمان‌هایی استفاده می‌شود که fast-path ندارند و timeout پیش‌فرض 4 ثانیه است
 
-### ۱. تست و نصب خودکار صوت و وابستگی‌های پایتون
-اسکریپت زیر را اجرا کنید:
-```bat
-INSTALL_GOOGLE_AUDIO.bat
-```
-این اسکریپت محیط مجازی پایتون (`.venv`) را آماده کرده، نیازمندی‌ها را نصب می‌کند و سلامت `SpeechRecognition`، `PyAudio`، میکروفون‌های فعال سیستم و `Google STT` را به صورت شفاف گزارش می‌دهد:
-```text
-SpeechRecognition: OK
-PyAudio: OK
-Microphone: OK (inputs found)
-Google STT: READY
-```
+## Stage 17 command engine
 
-### ۲. نصب پکیج‌های فلاتر (اختیاری در صورت نیاز)
-```cmd
-cd frontend
-flutter pub get
-```
+- Wake word is not required. “Smartis/اسمارتیز” is an optional leading prefix.
+- Persian is the first STT path; English is only a fallback.
+- Common web commands are deterministic and do not depend on Ollama.
+- Google/YouTube/Gmail and search requests open directly in Chrome; music playback is local/direct VLC and does not depend on YouTube.
+- Multi-step requests such as “Google → search Tom Hardy → open Wikipedia” execute as a real action chain.
+- Smartis has dynamic self-introduction responses and always identifies its creator as the Saeed Behrami team when asked.
+- The normal UI label is “در حال اجرا...” rather than “دارم فکر می‌کنم...”.
 
----
 
-## نحوه اجرا
+## Stage 18
+- Search parsing extracts only the intended query before the Wikipedia/navigation clause.
+- Factual questions use Wikipedia directly without opening a browser, then ask whether to continue reading.
+- Live news requests prefer reputable sources and expose source names.
+- Natural Persian/English arithmetic is routed to the safe calculator.
 
-برای اجرای کامل سیستم، دو فایل بتچ تعبیه شده است:
 
-1. اجرای بک‌اند پایتون:
-```bat
-run_backend.bat
-```
-2. اجرای فرانت‌اند فلاتر:
-```bat
-run_frontend.bat
-```
+## Stage 19 — Daily assistant dashboard + system control
 
-در صورت بروز هرگونه مشکل در کش بیلد فلاتر ویندوز، می‌توانید فایل زیر را اجرا کنید:
-```bat
-REPAIR_WINDOWS.bat
-```
+- Full black main window with a live clock, Jalali date, weather card, CPU/RAM usage, Smartis CPU/RAM usage, and sensor temperatures when Windows hardware monitoring exposes them.
+- Main-window TTS controls for Persian and English male/female Edge neural voices.
+- Windows Location privacy-settings shortcut when automatic location is unavailable.
+- Exact system and player volume percentages, with mute/unmute and active-player media transport.
+- Power actions (shutdown/restart/sleep) queue a short confirmation; file/folder create/delete do not. Confirmation accepts `بله`, `آره`, `تایید`, `تأیید`, `yes`, `confirm`, and similar direct affirmations.
+- Windows user language switching validates the requested language is installed before applying it.
+- Direct Windows Settings and Search actions.
+- Empty file/folder creation and follow-up naming, plus exact-name deletion under Desktop/Downloads/C:\ roots.
+- SymPy-backed calculator for natural Persian/English arithmetic, percentages, roots, trigonometry, powers, and simple equations.
+- Persian news mode filters to trusted Persian source domains/source names when metadata is available.
+- Weather supports a city such as `هوای همدان` / `هوای کرج` and location-based weather when Windows Location is enabled.
+Stage 19 Windows build hotfix
+- Fixed frontend/lib/app.dart syntax errors in the MaterialApp build tree and _voiceCard widget.
+- No feature logic was changed by this hotfix.
+- The corrected app.dart has balanced Dart delimiters.
 
----
 
-## سناریوی تست و کاربری
+## Stage 24 architecture
 
-1. دستیار Smartis را اجرا کنید. در پنل Live Log وضعیت `Microphone initialized` و `Listening for wake word` را مشاهده می‌کنید.
-2. بگویید: **«اسمارتیز»**
-3. Smartis با انیمیشن و صوت پاسخ می‌دهد: **«جانم»**
-4. سپس بگویید: **«کروم رو باز کن»**
-5. گوگل گفتار شما را با دقت بالا دریافت کرده، Fast Path مرورگر کروم را باز می‌کند، دستیار پاسخ صوتی می‌دهد و بلافاصله دوباره در وضعیت آماده‌باش کلمه کلیدی قرار می‌گیرد.
+- Unmatched natural-language commands are semantically planned by the local Ollama model; there is no OpenAI/ChatGPT API dependency.
+- Research uses Wikipedia first, then accessible public web search/results, with local Ollama synthesis when available.
+- Music commands search local Music/Downloads/Desktop/Videos folders and play matches directly in VLC. Explicit direct media URLs are also accepted. YouTube scraping/yt-dlp/Selenium are not used.
+
+
+## Stage 24 additions
+- Bounded local conversation memory and follow-up reference resolution.
+- Ollama receives recent local context for semantic multi-turn planning.
+- Online music playback restored through yt-dlp direct-stream extraction into VLC.
+- Local-folder music playback removed from the media command path.

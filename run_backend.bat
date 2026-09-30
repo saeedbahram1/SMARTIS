@@ -1,38 +1,46 @@
 @echo off
-setlocal enabledelayedexpansion
-title Smartis Backend
-
+setlocal
 cd /d "%~dp0backend"
+if errorlevel 1 goto :error
+
+echo ============================================================
+echo SMARTIS BACKEND
+echo ============================================================
 
 if not exist ".venv\Scripts\python.exe" (
-    echo [Smartis] Creating backend virtual environment (.venv)...
-    where py >nul 2>nul
-    if %errorlevel% equ 0 (
-        py -3 -m venv .venv
-    ) else (
-        python -m venv .venv
-    )
+    echo Creating Python virtual environment...
+    py -3 -m venv .venv
+    if errorlevel 1 goto :error
 )
 
-if not exist ".venv\Scripts\activate.bat" (
-    echo [Smartis ERROR] Failed to initialize Python virtual environment.
-    echo Please make sure Python 3.10+ is installed and in your PATH.
-    pause
-    exit /b 1
-)
-
-echo [Smartis] Activating virtual environment...
 call ".venv\Scripts\activate.bat"
+if errorlevel 1 goto :error
 
-echo [Smartis] Checking dependencies...
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+if errorlevel 1 goto :error
 
-echo [Smartis] Starting FastAPI Backend on 127.0.0.1:8765...
-python main.py
-
-if %errorlevel% neq 0 (
+if not exist "models\sherpa-fa\model.onnx" (
     echo.
-    echo [Smartis] Backend stopped with an error code: %errorlevel%
-    pause
+    echo [WARNING] Persian Sherpa model was not found.
+    echo Run SETUP_SHERPA_MODELS.bat first.
+    echo.
 )
+
+if not exist "models\sherpa-en\encoder-epoch-99-avg-1.onnx" (
+    echo [WARNING] English Sherpa model was not found.
+    echo Run SETUP_SHERPA_MODELS.bat first.
+    echo.
+)
+
+python main.py
+set "EXIT_CODE=%ERRORLEVEL%"
+echo.
+echo Backend stopped with code %EXIT_CODE%.
+pause
+endlocal & exit /b %EXIT_CODE%
+
+:error
+echo.
+echo Smartis backend could not start.
+pause
+endlocal & exit /b 1

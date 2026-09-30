@@ -1,20 +1,18 @@
-name: smartis_assistant
-description: Persian/English Smartis voice assistant
+name: smartis_desktop
+description: Persian/English Smartis Windows desktop voice assistant.
 publish_to: "none"
-version: 0.1.0+1
+version: 1.0.0+1
 
 environment:
-  sdk: ">=3.4.0 <4.0.0"
-  flutter: ">=3.22.0"
+  sdk: ">=3.6.0 <4.0.0"
+  flutter: ">=3.24.0"
 
 dependencies:
-  audioplayers: ^6.8.0
+  audioplayers: ^6.8.1
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
-  window_manager: ^0.4.3
-  web_socket_channel: ^3.0.1
-  http: ^1.2.2
+  web_socket_channel: ^3.0.3
+  http: ^1.6.0
 
 dev_dependencies:
   flutter_test:

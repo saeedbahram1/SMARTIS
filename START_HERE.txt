@@ -1,32 +1,26 @@
-SMARTIS — STAGE 5
+SMARTIS — START HERE
 
-- دکمه میکروفن حذف شده است.
-- Smartis با «اسمارتیز» یا «Smartis» فعال می‌شود.
-- پاسخ Wake فارسی: «جانم»
-- رنگ اصلی همه حالت‌ها: #FFD700
-- Listening / Thinking / Speaking دارای انیمیشن متفاوت هستند.
+1) First run SETUP_SHERPA_MODELS.bat if backend\models\sherpa-fa and sherpa-en are not already populated.
+2) Start Smartis with START_SMARTIS.bat, or run run_backend.bat and run_frontend.bat separately.
+3) The Python backend now owns the microphone. Flutter does not use record/startStream anymore.
+4) The backend keeps one microphone stream open, listens directly for commands, and pauses only while processing/TTS is active.
+5) The small microphone button in the HUD restarts the backend microphone service without restarting Flutter.
 
-ONLINE:
-STT = Google Web Speech
-TTS = Microsoft Edge TTS
+Important:
+- Do not copy .venv, build, .dart_tool, __pycache__, or downloaded models into the ZIP/repository.
+- The Windows CMake runner is included in this package so the project can build without regenerating the runner first.
+- If Windows build tools report a missing Visual C++ component, install the Visual Studio "Desktop development with C++" workload.
 
-OFFLINE:
-STT = faster-whisper محلی
-TTS = Windows SAPI / pyttsx3
 
-نصب Backend:
-pip install -r backend\requirements.txt
-
-نصب Flutter:
-cd frontend
-flutter pub get
-
-اجرا:
-run_backend.bat
-run_frontend.bat
-
-مدل Whisper:
-backend\models\whisper-small
-
-Agent:
-ollama pull qwen2.5:7b
+Stage 19 additions:
+- Black full-window dashboard with exact clock/Jalali date, weather, CPU/RAM and Smartis resource usage.
+- Main-window Persian/English Edge-TTS male/female selectors; settings persist.
+- Windows Location-aware weather with a button to open Location privacy settings when disabled.
+- Direct system volume percentages, active-player volume percentages, mute/unmute and media transport remain fast-path.
+- Power actions keep a 45-second confirmation window; Persian “بله/آره/تایید/تأیید” and English confirmations are accepted.
+- Windows user language switching checks installed languages first.
+- File/folder creation and deletion are direct voice actions; folder/file names can be requested in a follow-up utterance.
+- Windows Settings and Windows Search commands are direct.
+- Calculator now uses SymPy for arithmetic, percentages, roots, trig and simple equations.
+- Persian news filtering accepts trusted Persian domains/source names.
+- Microphone is automatically restarted once after backend startup.
