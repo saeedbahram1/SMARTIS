@@ -97,13 +97,10 @@ The entries come from the backend: `backend/agent/logbus.py` emits structured
 events over the existing WebSocket as `{"type": "log", ...}` frames, and
 `GET /logs` returns the backlog.
 
-## 6. Chat tab (matching your screenshot, Telegram-style send button)
-
+## 6. Chat tab 
 New widget `frontend/lib/widgets/smartis_chat_panel.dart`:
 
 * Segmented switch at the top of the left column: **پنل لاگ‌های فنی** ⇄ **چت**
-* Telegram-style circular gradient send button with a paper-plane icon
-  (`Icons.send_rounded`), glow when active, dimmed when empty
 * Optional mic button, search icon inside the field, RTL Persian placeholder
 * Message bubbles with timestamps and double-check marks
 * "Smartis در حال نوشتن..." typing indicator
