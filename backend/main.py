@@ -18,13 +18,15 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent.command_normalizer import normalize_command_text
-from agent.executor import execute_plan, execute_pending_confirmation, pending_confirmation, clear_pending_confirmation
+from agent.executor import execute_plan, execute_pending_confirmation, pending_confirmation, pending_summary, clear_pending_confirmation
 from agent.fast_path import fast_plan
 from agent.planner import fallback_plan, plan_with_ollama
 from agent.context_memory import memory
 from agent import chat as chat_agent
+from agent import router
 from agent.echo_guard import guard as echo_guard
 from agent.logbus import logbus
+from agent.ollama_model import model_status, resolve_model, ensure_ollama, shutdown_ollama
 from config import HOST, PORT, NOISE_GATE_MODE, SPEAK_TAIL_GUARD_SECONDS
 from services.internet_service import InternetMonitor
 from services.microphone_service import MicrophoneService
@@ -35,6 +37,7 @@ stt = SherpaService()
 internet = InternetMonitor()
 tts = TTSService(internet)
 microphone = MicrophoneService(stt)
+UVICORN_SERVER = None
 
 # ---------------------------------------------------------------------------
 # Dead-end detection.
@@ -116,64 +119,10 @@ def _effective_language(text: str, language: str | None) -> str | None:
     return language
 
 
-# Utterances that are always meaningful, even when they are only one short word.
-_SHORT_COMMANDS = {
-    "بله", "آره", "اره", "نه", "لغو", "بیخیال", "ادامه", "ادامه بده", "مکث", "توقف",
-    "بس", "بسه", "کمک", "سلام", "درود", "تایید", "تأیید", "باشه", "حتما", "حتماً",
-    "بخون", "بیشتر بگو", "کاملش کن",
-    "yes", "yeah", "yep", "no", "nope", "stop", "cancel", "continue", "ok", "okay",
-    "confirm", "read it", "tell me more",
-}
-
-
-def _should_ignore_transcript(text: str, language: str | None) -> bool:
-    """Reject only clear STT noise.
-
-    `NOISE_GATE_MODE=relaxed` (default) keeps every plausible sentence so Smartis
-    can answer it conversationally. `strict` restores the old aggressive gate.
-    """
-    value = normalize_command_text(text).strip()
-    if not value:
-        return True
-
-    low = value.lower()
-
-    if NOISE_GATE_MODE == "strict":
-        if re.search(r"[\u0600-\u06FF]", value):
-            known = {"سلام", "درود", "گوگل", "یوتیوب", "اسمارتیز", "اسمارتیس", "ادامه", "ادامه بده",
-                     "بله", "آره", "نه", "لغو", "کمک", "توقف", "بس", "مکث"}
-            if low in known:
-                return False
-        words = re.findall(r"[A-Za-z]+|[\u0600-\u06FF]+", value)
-        if len(words) == 1 and not re.search(
-            r"(?:[?؟]|چی|چیه|کیه|what|who|how|open|play|search|google|volume|weather|time|date|start|stop|pause|cancel|yes|no)$",
-            low, re.I,
-        ):
-            return True
-        if len(words) <= 2 and len(value) < 7 and not re.search(
-            r"(?:باز|برو|پخش|سرچ|جست|حساب|صدا|هوا|ساعت|تاریخ|زبان|بساز|حذف|تحقیق|بررسی|پیدا|"
-            r"play|open|search|find|calculate|weather|time|language|create|delete|research|investigate)",
-            low, re.I,
-        ):
-            return True
-        return False
-
-    # ---- relaxed (default) -------------------------------------------------
-    # Short confirmations/continuations are real commands, never noise.
-    if low in _SHORT_COMMANDS:
-        return False
-    # Persian one/two letter fragments are almost always noise.
-    if re.fullmatch(r"[\u0600-\u06FF\s]{1,2}", value):
-        return True
-    # Classic English STT hallucinations on silence/background noise.
-    if low in {"you", "yeah", "uh", "um", "hmm", "mm", "oh", "ah", "the", "a", "i", "it",
-               "so", "ok", "okay", "bye", "thank you", "thanks for watching", "subscribe"}:
-        return True
-    # A single latin token with no command/question cue is a noise hypothesis.
-    words = re.findall(r"[A-Za-z]+|[\u0600-\u06FF]+", value)
-    if len(words) == 1 and len(value) <= 3 and not re.search(r"[?؟]", value):
-        return True
-    return False
+# Noise gate, yes/no recognition and command-vs-chat routing live in agent/router.py.
+_should_ignore_transcript = router.should_ignore_transcript
+_affirmative_text = router.affirmative_text
+_negative_text = router.negative_text
 
 
 _LOG_MEDIA_TOOLS = {
@@ -203,6 +152,46 @@ def _brief(value, limit: int = 420) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _looks_like_command(text: str) -> bool:
+    low = normalize_command_text(text).lower()
+    command_cues = (
+        "باز کن", "بازش کن", "اجرا کن", "برو به", "برو تو", "بیاور",
+        "open", "launch", "start", "go to", "volume", "صدا", "میزان صدا",
+        "پخش", "آهنگ", "موزیک", "play", "pause", "stop", "next", "previous",
+        "ساخت", "بساز", "ایجاد", "create", "delete", "حذف", "پاک",
+        "خاموش", "ری استارت", "restart", "shutdown", "sleep", "خواب",
+        "تنظیمات", "settings", "زبان ویندوز", "windows language",
+        "میکروفون", "microphone", "ویندوز سرچ", "windows search",
+    )
+    return any(cue in low for cue in command_cues)
+
+
+def _has_explicit_information_intent(text: str) -> bool:
+    low = normalize_command_text(text).lower()
+    info_cues = (
+        "سرچ", "جستجو", "جست‌وجو", "search", "look up",
+        "تحقیق", "بررسی", "درباره", "در مورد", "راجع به",
+        "who ", "what ", "why ", "how ", "چیست", "چیه", "کیه",
+        "اخبار", "خبر", "news", "weather", "آب و هوا", "هوا",
+    )
+    return any(cue in low for cue in info_cues)
+
+
+def _planner_has_spurious_search(text: str, result: dict) -> bool:
+    if not _looks_like_command(text) or _has_explicit_information_intent(text):
+        return False
+    plan = result.get("plan") or {}
+    for action in plan.get("actions") or []:
+        tool = str(action.get("tool") or "")
+        if tool == "web_research":
+            return True
+        if tool == "open_chrome_url":
+            url = str((action.get("args") or {}).get("url") or "").lower()
+            if "google.com/search" in url or "bing.com/search" in url:
+                return True
+    return False
+
+
 def build_agent_plan(text: str, language: str | None) -> dict:
     normalized = normalize_command_text(text)
     contextual = memory.resolve_references(normalized)
@@ -226,6 +215,13 @@ def build_agent_plan(text: str, language: str | None) -> dict:
     # LOCAL Ollama model. This is the semantic layer: it understands paraphrases,
     # sentence structure and targets instead of requiring a fixed trigger phrase.
     result = plan_with_ollama(contextual, language, memory.context_text())
+    if result.get("ok") and _planner_has_spurious_search(contextual, result):
+        logbus.emit(
+            "PLANNER",
+            "Rejected a planner-generated web search for a command-like utterance.",
+            _brief({"text": contextual, "plan": result.get("plan")}),
+        )
+        result = {"ok": False, "provider": "ollama-local", "error": "spurious_search_for_command"}
     if result.get("ok"):
         plan = result.get("plan") or {}
         actions = plan.get("actions") or []
@@ -244,27 +240,11 @@ def build_agent_plan(text: str, language: str | None) -> dict:
             _brief(reply),
         )
 
-    # ------------------------------------------------------------------
-    # Conversational fallback: Smartis answers like a human instead of
-    # saying "I did not understand". Local model only, no paid cloud API.
-    # ------------------------------------------------------------------
-    conversational = chat_agent.respond(contextual, language, memory.context_text())
-    if conversational.get("ok") and str(conversational.get("reply") or "").strip():
-        logbus.emit(
-            "PLANNER",
-            f"Conversational answer generated ({conversational.get('provider')}).",
-            _brief(conversational.get("reply")),
-        )
-        return {
-            "ok": True,
-            "provider": conversational.get("provider", "chat-local"),
-            "conversational": True,
-            "plan": {
-                "reply": str(conversational.get("reply") or "").strip(),
-                "actions": [],
-                "needs_confirmation": False,
-            },
-        }
+    # Command mode must never fall through into conversational Chat.
+    # If deterministic Fast Path cannot identify the command, only the
+    # command planner may be used; its short timeout and JSON-only contract
+    # keep execution separate from the Chat/Qwen conversational surface.
+    logbus.emit("PLANNER", "Command planner did not produce an executable plan; using deterministic fallback.", _brief({"text": contextual, "error": result.get("error")}))
 
     # Absolute last resort — still never a dead end.
     fallback = fallback_plan(contextual)
@@ -279,185 +259,14 @@ def build_agent_plan(text: str, language: str | None) -> dict:
     return fallback
 
 
-def _affirmative_text(text: str) -> bool:
-    value = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    if value in {"بله", "آره", "اره", "تایید", "تأیید", "تایید میکنم", "تأیید می‌کنم", "حتما", "حتماً",
-                 "باشه", "yes", "yeah", "yep", "sure", "okay", "ok", "confirm", "confirmed"}:
-        return True
-    return bool(re.fullmatch(r"(?:بله|آره|اره|حتما|حتماً|باشه)(?:\s+(?:انجام(?:ش)?|تأیید(?:ش)?))?(?:\s+(?:بده|بدهش|کن|کنش|بکن))?", value, re.I))
+def process_command(text: str, language: str | None, request_id: str | None = None, thinking: bool = False) -> dict:
+    """Voice entry point (microphone transcript). Same router as typed chat."""
+    return router.handle_input(text, language, source="voice", request_id=request_id, thinking=thinking)
 
 
-def _negative_text(text: str) -> bool:
-    value = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    if value in {"نه", "نخیر", "لغو", "بیخیال", "no", "nope", "cancel", "stop"}:
-        return True
-    if re.search(r"^(?:نه|نخیر|بیخیال|نمیخوام|نمی‌خوام|no|nope|cancel|stop)\b", value, re.I):
-        return True
-    return bool(re.search(r"(?:لغو|بیخیال|cancel|stop)\s*(?:کن|کنش|بده|بدهش|شو)?$", value, re.I))
-
-
-def _confirmation_prompt(language: str | None) -> str:
-    return "تأیید می‌کنی؟" if language != "en" else "Do you want me to go ahead?"
-
-
-def process_command(text: str, language: str | None) -> dict:
-    """Plan + execute. Confirmation replies are consumed by the backend state."""
-    # ------------------------------------------------------------------
-    # Echo protection: never treat Smartis' own voice as a new command.
-    # ------------------------------------------------------------------
-    if echo_guard.is_echo(text):
-        logbus.emit("STT", "Self-voice detected and discarded (echo guard).", _brief(text))
-        return {
-            "ok": True,
-            "ignored": True,
-            "provider": "echo-guard",
-            "plan": {"reply": "", "actions": [], "needs_confirmation": False},
-            "execution": {"ok": True, "results": []},
-        }
-
-    # A pending confirmation is consumed BEFORE the noise gate: a bare "بله"
-    # must be able to confirm, and it is only three characters long.
-    awaiting = pending_confirmation()
-
-    if not awaiting and _should_ignore_transcript(text, language):
-        logbus.emit("STT", "Transcript discarded as background noise.", _brief(text))
-        return {
-            "ok": True,
-            "ignored": True,
-            "provider": "noise-gate",
-            "plan": {"reply": "", "actions": [], "needs_confirmation": False},
-            "execution": {"ok": True, "results": []},
-        }
-
-    if awaiting:
-        if _affirmative_text(text):
-            logbus.emit("CONFIRMATION", "User confirmed the pending action.", _brief(text))
-            execution = execute_pending_confirmation()
-            ok = execution.get("ok") is True
-            reply = ("انجام شد." if language != "en" else "Done.") if ok else (
-                f"انجام نشد؛ {execution.get('error') or 'عملیات با خطا مواجه شد.'}"
-                if language != "en"
-                else f"It failed: {execution.get('error') or 'the operation returned an error.'}"
-            )
-            return {
-                "ok": ok,
-                "provider": "confirmation",
-                "plan": {"reply": reply, "actions": [], "needs_confirmation": False},
-                "execution": execution,
-            }
-        if _negative_text(text):
-            logbus.emit("CONFIRMATION", "User cancelled the pending action.", _brief(text))
-            clear_pending_confirmation()
-            return {
-                "ok": True,
-                "provider": "confirmation",
-                "plan": {
-                    "reply": "باشه، انجامش نمی‌دم." if language != "en" else "Okay, I won't do it.",
-                    "actions": [],
-                    "needs_confirmation": False,
-                },
-                "execution": {"ok": True, "needs_confirmation": False, "results": []},
-            }
-
-    planned = build_agent_plan(text, language)
-    if planned.get("ok") is not True:
-        return planned
-
-    plan = planned.get("plan") or {}
-    if plan.get("needs_confirmation") is True:
-        prompt = str(plan.get("reply") or "").strip()
-        if _is_dead_end(prompt):
-            prompt = _confirmation_prompt(language)
-        plan = dict(plan)
-        plan["reply"] = prompt
-        return {
-            "ok": True,
-            "provider": planned.get("provider", "unknown"),
-            "plan": plan,
-            "execution": {"ok": True, "needs_confirmation": True, "results": []},
-        }
-
-    execution = execute_plan(plan, False)
-    reply = str(plan.get("reply") or "")
-
-    for item in execution.get("results") or []:
-        tool = str(item.get("tool") or "")
-        result = item.get("result") or {}
-        ok = result.get("ok") is True
-        logbus.emit(
-            _log_category_for_tool(tool),
-            f"{'Executed' if ok else 'Failed'}: {tool}",
-            _brief({"tool": tool, "result": result}),
-        )
-    if execution.get("needs_confirmation") is True:
-        logbus.emit(
-            "CONFIRMATION",
-            "Destructive action queued; waiting for the user's confirmation.",
-            _brief(plan),
-        )
-
-    if execution.get("needs_confirmation") is True:
-        # Reached when the planner did not flag confirmation but the executor
-        # did (e.g. the local model produced a power action directly).
-        prompt = _confirmation_prompt(language)
-        plan = dict(plan)
-        plan["reply"] = prompt
-        plan["needs_confirmation"] = True
-        return {
-            "ok": True,
-            "provider": planned.get("provider", "unknown"),
-            "plan": plan,
-            "execution": execution,
-        }
-
-    if execution.get("ok") is not True:
-        error = str(execution.get("error") or ("عملیات با خطا مواجه شد." if language != "en" else "The operation failed."))
-        reply = (f"انجام نشد؛ {error}" if language != "en" else f"It failed: {error}")
-
-    if not reply:
-        reply = "انجام شد." if language != "en" else "Done."
-
-    memory.remember(text, plan, execution, reply=reply)
-    response_plan = dict(plan)
-    response_plan["reply"] = reply
-    return {
-        "ok": execution.get("ok") is True,
-        "provider": planned.get("provider", "unknown"),
-        "plan": response_plan,
-        "execution": execution,
-    }
-
-
-def process_chat(text: str, language: str | None) -> dict:
-    """Typed-chat entry point. Answers like a human, never a dead end."""
-    value = str(text or "").strip()
-    if not value:
-        return {"ok": False, "error": "Text is empty."}
-
-    language = _effective_language(value, language)
-
-    # A typed message that is clearly a Windows command still executes.
-    fast = fast_plan(normalize_command_text(value), language)
-    if fast is not None and (fast.get("plan") or {}).get("actions"):
-        result = process_command(value, language)
-        result["mode"] = "command"
-        return result
-
-    reply = chat_agent.respond(value, language, memory.context_text())
-    plan = {
-        "reply": str(reply.get("reply") or "").strip(),
-        "actions": [],
-        "needs_confirmation": False,
-    }
-    execution = {"ok": True, "needs_confirmation": False, "results": []}
-    memory.remember(value, plan, execution, reply=plan["reply"])
-    return {
-        "ok": True,
-        "mode": "chat",
-        "provider": reply.get("provider", "chat-local"),
-        "plan": plan,
-        "execution": execution,
-    }
+def process_chat(text: str, language: str | None, request_id: str | None = None, thinking: bool = False) -> dict:
+    """Typed entry point. Commands are executed, everything else is answered by Ollama."""
+    return router.handle_input(text, language, source="text", request_id=request_id, thinking=thinking)
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +294,14 @@ def _hold_microphone(seconds: float) -> None:
         microphone.pause_listening()
     except Exception:
         pass
+
+
+def _release_microphone_hold() -> None:
+    """Immediately release the extra TTS safety hold after Stop is pressed."""
+    global _SPEAK_UNTIL, _SPEAK_HELD
+    with _SPEAK_LOCK:
+        _SPEAK_UNTIL = 0.0
+        _SPEAK_HELD = False
 
 
 def _microphone_watchdog() -> None:
@@ -526,8 +343,8 @@ def _estimate_speech_seconds(result: dict, text: str) -> float:
         seconds = 0.0
     if seconds <= 0.0:
         # Fallback heuristic for offline TTS: ~13 Persian/English chars per second.
-        seconds = max(1.5, len(str(text or "")) / 13.0)
-    return max(1.5, seconds + SPEAK_TAIL_GUARD_SECONDS)
+        seconds = max(0.8, len(str(text or "")) / 13.0)
+    return max(0.75, seconds + SPEAK_TAIL_GUARD_SECONDS)
 
 
 @asynccontextmanager
@@ -543,26 +360,40 @@ async def lifespan(app: FastAPI):
         print(f"  -> {stt.fa_error}")
     if not status["en_ready"]:
         print(f"  -> {stt.en_error}")
+    # Load Qwen in the BACKGROUND with exactly the options chat uses. It no
+    # longer blocks start-up, and chat does not depend on it: Ollama loads the
+    # model on demand if a request arrives before the warm-up has finished.
+    ollama = model_status()
+    logbus.emit("OLLAMA", "Ollama local model status", _brief(ollama))
+    warmup = {"ok": None, "note": "running in background"}
+
+    def _background_warmup() -> None:
+        result = chat_agent.warm_up()
+        logbus.emit("OLLAMA", f"Model warm-up {'finished' if result.get('ok') else 'failed'}", _brief(result))
+
+    threading.Thread(target=_background_warmup, name="smartis-ollama-warmup", daemon=True).start()
+
     microphone.start()
     threading.Timer(1.2, microphone.restart).start()
     print(f"  Microphone service started          : {microphone.status_dict()}")
     print("  Direct listening                    : ENABLED")
     print(f"  Noise gate mode                     : {NOISE_GATE_MODE}")
-    print(f"  Conversational layer                : local Ollama ({chat_agent.CHAT_MODEL})")
+    print(f"  Conversational layer                : local Ollama ({resolve_model()})")
     print("=" * 60)
     logbus.emit(
         "SYSTEM",
         "Smartis backend started: STT loaded, microphone listening, conversational layer ready.",
         _brief({"persian_stt": status["fa_ready"], "english_stt": status["en_ready"],
-                "noise_gate": NOISE_GATE_MODE, "chat_model": chat_agent.CHAT_MODEL}),
+                "noise_gate": NOISE_GATE_MODE, "chat_model": resolve_model(), "ollama_warmup": warmup.get("ok")}),
     )
     threading.Thread(target=_microphone_watchdog, name="smartis-mic-watchdog", daemon=True).start()
-    chat_agent.warm_up()
     yield
     microphone.stop()
+    ollama_shutdown = shutdown_ollama()
+    logbus.emit("SYSTEM", "Smartis shutdown: microphone and Smartis-owned Ollama server stopped.", _brief(ollama_shutdown))
 
 
-app = FastAPI(title="Smartis Backend", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="Smartis Backend", version="2.13.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -585,8 +416,10 @@ async def health():
             "online_tts": True,
             "direct_listening": True,
             "conversational": True,
-            "chat_model": chat_agent.CHAT_MODEL,
+            "chat_model": resolve_model(),
+            "ollama": model_status(),
             "noise_gate": NOISE_GATE_MODE,
+            "pending_confirmation": pending_summary("fa"),
             "echo_guard": echo_guard.stats(),
         }
     )
@@ -748,18 +581,44 @@ async def speak(payload: dict):
 async def command(payload: dict):
     text = str(payload.get("text", "")).strip()
     language = payload.get("language")
+    request_id = str(payload.get("request_id") or "").strip() or None
+    thinking = bool(payload.get("thinking", False))
     if not text:
         return {"ok": False, "error": "Text is empty."}
-    return _json_safe(await asyncio.to_thread(process_command, text, language))
+    return _json_safe(await asyncio.to_thread(process_command, text, language, request_id, thinking))
 
 
 @app.post("/chat")
 async def chat_endpoint(payload: dict):
     text = str(payload.get("text", "")).strip()
     language = payload.get("language")
+    request_id = str(payload.get("request_id") or "").strip() or None
+    thinking = bool(payload.get("thinking", False))
     if not text:
         return {"ok": False, "error": "Text is empty."}
-    return _json_safe(await asyncio.to_thread(process_chat, text, language))
+    return _json_safe(await asyncio.to_thread(process_chat, text, language, request_id, thinking))
+
+
+@app.post("/chat/cancel")
+async def chat_cancel(payload: dict):
+    request_id = str(payload.get("request_id") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id is required"}
+    return {"ok": chat_agent.cancel_request(request_id), "cancelled": True}
+
+
+@app.post("/shutdown")
+async def shutdown_backend():
+    global UVICORN_SERVER
+    # Do the owned-resource cleanup here as well as in lifespan. This makes
+    # the explicit Smartis close button deterministic even if Uvicorn exits
+    # before the lifespan finalizer gets a chance to run.
+    shutdown_result = await asyncio.to_thread(shutdown_ollama)
+    microphone.stop()
+    if UVICORN_SERVER is not None:
+        UVICORN_SERVER.should_exit = True
+    logbus.emit("SYSTEM", "Explicit Smartis shutdown requested", _brief(shutdown_result))
+    return {"ok": True, "shutting_down": True, "ollama": shutdown_result}
 
 
 @app.post("/agent/plan")
@@ -786,6 +645,7 @@ async def websocket_endpoint(websocket: WebSocket):
     events = microphone.subscribe()
     log_events = logbus.subscribe()
     send_lock = asyncio.Lock()
+    background_tasks: set = set()
 
     async def send_json_event(payload: dict) -> None:
         async with send_lock:
@@ -800,7 +660,8 @@ async def websocket_endpoint(websocket: WebSocket):
             "microphone": microphone.status_dict(),
             "direct_listening": True,
             "conversational": True,
-            "chat_model": chat_agent.CHAT_MODEL,
+            "chat_model": resolve_model(),
+            "ollama": model_status(),
             "noise_gate": NOISE_GATE_MODE,
         }
     )
@@ -818,7 +679,7 @@ async def websocket_endpoint(websocket: WebSocket):
             except queue.Empty:
                 pass
 
-    for entry in logbus.recent(80):
+    for entry in logbus.recent(400):
         await send_json_event(entry)
 
     async def receive_actions() -> None:
@@ -846,6 +707,10 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "mic_restart":
                 await asyncio.to_thread(microphone.restart)
                 await send_json_event({"type": "mic_restarted", "microphone": microphone.status_dict()})
+            elif action == "speak_stop":
+                _release_microphone_hold()
+                microphone.resume_listening()
+                await send_json_event({"type": "speech_stopped"})
             elif action == "speak":
                 text = str(message.get("text", ""))
                 language = message.get("language")
@@ -856,16 +721,26 @@ async def websocket_endpoint(websocket: WebSocket):
                 _hold_microphone(hold)
                 result["suppress_seconds"] = round(hold, 2)
                 await send_json_event({"type": "tts_result", **result})
-            elif action == "command":
+            elif action in {"command", "chat"}:
                 text = str(message.get("text", "")).strip()
                 language = message.get("language")
-                result = await asyncio.to_thread(process_command, text, language)
-                await send_json_event({"type": "command", **result})
-            elif action == "chat":
-                text = str(message.get("text", "")).strip()
-                language = message.get("language")
-                result = await asyncio.to_thread(process_chat, text, language)
-                await send_json_event({"type": "chat", **result})
+                request_id = str(message.get("request_id") or "").strip() or None
+                thinking = bool(message.get("thinking", False))
+                fn = process_command if action == "command" else process_chat
+
+                async def run_request(fn=fn, kind=action, text=text, language=language, request_id=request_id, thinking=thinking) -> None:
+                    # Own task: a slow model answer must never block the socket
+                    # (mic pause/resume, ping, cancel) while Ollama is thinking.
+                    try:
+                        result = await asyncio.to_thread(fn, text, language, request_id, thinking)
+                        await send_json_event({"type": kind, **result})
+                    except Exception as exc:  # noqa: BLE001
+                        logbus.emit("SYSTEM", f"{kind} request failed: {type(exc).__name__}", _brief(exc))
+                        await send_json_event({"type": kind, "ok": False, "error": str(exc)})
+
+                task = asyncio.create_task(run_request())
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
             elif action == "agent_plan":
                 text = str(message.get("text", "")).strip()
                 language = message.get("language")
@@ -900,9 +775,13 @@ async def websocket_endpoint(websocket: WebSocket):
         for task in (sender, receiver):
             task.cancel()
         await asyncio.gather(sender, receiver, return_exceptions=True)
+        for task in list(background_tasks):
+            task.cancel()
         microphone.unsubscribe(events)
         logbus.unsubscribe(log_events)
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT)
+    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="warning")
+    UVICORN_SERVER = uvicorn.Server(config)
+    UVICORN_SERVER.run()

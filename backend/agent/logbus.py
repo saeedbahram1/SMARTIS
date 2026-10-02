@@ -14,7 +14,7 @@ import time
 from collections import deque
 from typing import Any
 
-CATEGORIES = ("SYSTEM", "MEDIA", "EXECUTOR", "FAST_PATH", "PLANNER", "STT", "CONFIRMATION")
+CATEGORIES = ("SYSTEM", "MEDIA", "EXECUTOR", "FAST_PATH", "PLANNER", "STT", "CONFIRMATION", "ROUTER", "CHAT", "OLLAMA")
 
 
 class LogBus:
@@ -23,6 +23,8 @@ class LogBus:
         self._entries: deque[dict[str, Any]] = deque(maxlen=max_entries)
         self._subscribers: set = set()
         self._seq = 0
+        # Lets the UI de-duplicate entries re-sent after a WebSocket reconnect.
+        self.session = str(int(time.time()))
 
     def subscribe(self):
         import queue as _queue
@@ -44,6 +46,7 @@ class LogBus:
             entry = {
                 "type": "log",
                 "id": self._seq,
+                "session": self.session,
                 "category": cat,
                 "message": str(message or ""),
                 "detail": (str(detail) if detail else None),

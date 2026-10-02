@@ -1,8 +1,10 @@
 import 'dart:async';
 
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'services/backend_socket.dart';
 import 'services/windows_window.dart';
 import 'widgets/smartis_chat_panel.dart';
@@ -23,6 +25,8 @@ class _SmartisAppState extends State<SmartisApp> {
   // Structured technical logs (streamed from the backend) + typed-chat history.
   final List<SmartisLogEntry> techLogs = [];
   final List<SmartisChatMessage> chat = [];
+  // Backend log entries are re-sent after every WebSocket reconnect; remember what was shown.
+  final Set<String> _seenLogKeys = <String>{};
 
   Timer? clockTimer;
   Timer? dashboardTimer;
@@ -44,6 +48,14 @@ class _SmartisAppState extends State<SmartisApp> {
   int leftTab = 0; // 0 = Technical Logs, 1 = Chat
   bool backendConnected = false;
   bool chatBusy = false;
+  bool chatThinking = false;
+  String? activeChatRequestId;
+  int _chatGeneration = 0;
+
+  // Voice operations share the same stop button as typed chat. The generation
+  // token lets a late STT/model response safely die after the user presses Stop.
+  String? activeVoiceRequestId;
+  int _voiceGeneration = 0;
 
   @override
   void initState() {
@@ -135,6 +147,11 @@ class _SmartisAppState extends State<SmartisApp> {
   }
 
   void _pushTechLog(Map<String, dynamic> frame) {
+    final session = frame['session']?.toString();
+    final id = frame['id']?.toString();
+    if (session != null && id != null) {
+      if (!_seenLogKeys.add('$session:$id')) return;
+    }
     setState(() {
       techLogs.add(
         SmartisLogEntry(
@@ -148,12 +165,18 @@ class _SmartisAppState extends State<SmartisApp> {
     });
   }
 
-  void _pushChat(String text, {required bool fromUser, String? provider}) {
+  void _pushChat(String text, {required bool fromUser, String? provider, bool confirm = false}) {
     if (!mounted) return;
     setState(() {
-      chat.add(SmartisChatMessage(text: text, fromUser: fromUser, time: _stamp(), provider: provider));
+      chat.add(SmartisChatMessage(text: text, fromUser: fromUser, time: _stamp(), provider: provider, confirm: confirm));
       if (chat.length > 300) chat.removeRange(0, chat.length - 300);
     });
+  }
+
+  Future<void> _copyChatMessage(String text) async {
+    if (text.trim().isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: text));
+    _log('Chat message copied', category: 'CHAT');
   }
 
   Future<void> _refreshDashboard() async {
@@ -186,113 +209,192 @@ class _SmartisAppState extends State<SmartisApp> {
 
   Future<void> _onCommand(Map<String, dynamic> result) async {
     if (!mounted || shuttingDown) return;
+    final generation = ++_voiceGeneration;
+    activeVoiceRequestId = null;
     try {
       if (result['ok'] != true) {
+        if (generation != _voiceGeneration) return;
         setState(() { processing = false; status = 'خطا در تشخیص گفتار'; audioLevel = 0; });
         _log('STT failed • ${result['error'] ?? 'unknown'}', category: 'STT');
         return;
       }
       if (result['ignored'] == true) {
+        if (generation != _voiceGeneration) return;
         processing = false;
         _log('Transcript ignored (noise/echo) • ${result['provider'] ?? ''}', category: 'STT');
         return;
       }
       final text = (result['text'] ?? '').toString().trim();
       final language = (result['language'] ?? '').toString().trim();
+      if (generation != _voiceGeneration) return;
       setState(() { transcript = text.isEmpty ? 'صدایی تشخیص داده نشد' : text; detectedLanguage = language; mode = result['offline'] == true ? 'OFFLINE STT' : 'ONLINE'; visualState = SmartisVisualState.thinking; status = text.isEmpty ? 'صدایی تشخیص داده نشد' : 'در حال اجرا...'; audioLevel = 0; });
-      _log('Recognized audio text: «$text»', category: 'STT');
+      _log('Recognized audio text: «$text» • ${result['stt_elapsed_ms'] ?? '?'}ms', category: 'STT');
       if (text.isNotEmpty) {
         _pushChat(text, fromUser: true);
-        processing = true;
-        await _runAgent(text, language.isEmpty ? null : language);
-        processing = false;
+        setState(() => processing = true);
+        final requestId = 'v${DateTime.now().microsecondsSinceEpoch}_${generation}';
+        activeVoiceRequestId = requestId;
+        await _runAgent(text, language.isEmpty ? null : language, generation, requestId);
       }
     } finally {
-      if (!mounted || shuttingDown) return;
+      if (!mounted || shuttingDown || generation != _voiceGeneration) return;
+      activeVoiceRequestId = null;
       processing = false;
       backend.resumeListening();
       setState(() { visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; audioLevel = 0; });
     }
   }
 
-  Future<void> _runAgent(String text, String? language) async {
+  /// Shows and speaks ONE backend answer. Typed chat and voice share it, so a
+  /// command result, a confirmation question and a chat reply behave the same.
+  /// Returns true when the answer is a confirmation question (still pending).
+  Future<bool> _presentResponse(
+    Map<String, dynamic> response,
+    String? language, {
+    int? operationGeneration,
+  }) async {
+    if (response['cancelled'] == true) return false;
+    if (operationGeneration != null && operationGeneration != _voiceGeneration) return false;
+    final plan = Map<String, dynamic>.from(response['plan'] as Map? ?? const {});
+    final execution = Map<String, dynamic>.from(response['execution'] as Map? ?? const {});
+    final mode = (response['mode'] ?? '').toString();
+    final provider = response['provider']?.toString();
+    final reply = (plan['reply'] ?? '').toString().trim();
+    final needsConfirm = response['needs_confirmation'] == true ||
+        execution['needs_confirmation'] == true ||
+        plan['needs_confirmation'] == true;
+    bool hasArabicScript(String t) => RegExp(r'[\u0600-\u06FF]').hasMatch(t);
+
+    if (needsConfirm) {
+      final q = reply.isNotEmpty ? reply : (language == 'en' ? 'Please confirm.' : 'تأیید می‌کنی؟');
+      if (mounted) setState(() => status = 'منتظر تأیید...');
+      _pushChat(q, fromUser: false, provider: 'confirmation', confirm: true);
+      await _speak(q, hasArabicScript(q) ? 'fa' : 'en', operationGeneration: operationGeneration);
+      return true;
+    }
+
+    // For executed commands the tool's own speech (e.g. the full weather report) wins.
+    final spokenExplicit = (response['spoken_reply'] ?? '').toString().trim();
+    final text = (mode == 'command' && response['ok'] == true && spokenExplicit.isNotEmpty) ? spokenExplicit : reply;
+    if (text.isEmpty) {
+      if (mode == 'chat') _pushChat('پاسخی تولید نشد.', fromUser: false, provider: provider);
+      return false;
+    }
+    _pushChat(text, fromUser: false, provider: provider);
+    await _speak(text, hasArabicScript(text) ? 'fa' : 'en', operationGeneration: operationGeneration);
+    return false;
+  }
+
+  /// Voice path: the transcript goes through the same router as typed chat.
+  Future<void> _runAgent(
+    String text,
+    String? language,
+    int generation,
+    String requestId,
+  ) async {
     try {
       final started = DateTime.now();
-      final response = await backend.command(text, language);
-      _log('Execute • ${DateTime.now().difference(started).inMilliseconds}ms • ${response['provider'] ?? 'unknown'}', category: 'EXECUTOR');
-      if (response['ok'] != true) {
-        await _speak(language == 'fa' ? 'در اجرای درخواست مشکلی پیش آمد.' : 'I could not execute that request.', language);
+      final response = await backend.command(text, language, requestId: requestId, thinking: chatThinking);
+      if (!mounted || generation != _voiceGeneration) return;
+      _log(
+        'Route • ${DateTime.now().difference(started).inMilliseconds}ms • ${response['mode'] ?? '-'} • ${response['provider'] ?? 'unknown'}',
+        category: 'ROUTER',
+      );
+      if (response['ignored'] == true) return;
+      if (response['ok'] != true && response['plan'] == null) {
+        final msg = language == 'fa' ? 'در اجرای درخواست مشکلی پیش آمد.' : 'I could not execute that request.';
+        _pushChat(msg, fromUser: false, provider: 'error');
+        await _speak(msg, language, operationGeneration: generation);
         return;
       }
-      final plan = Map<String, dynamic>.from(response['plan'] as Map? ?? {});
-      final execution = Map<String, dynamic>.from(response['execution'] as Map? ?? {});
-      if (execution['needs_confirmation'] == true || plan['needs_confirmation'] == true) {
-        setState(() => status = 'منتظر تأیید...');
-        final q = (plan['reply'] ?? (language == 'fa' ? 'تأیید می‌کنی؟' : 'Please confirm.')).toString();
-        _pushChat(q, fromUser: false, provider: 'confirmation');
-        await _speak(q, language);
-        return;
-      }
-      final results = (execution['results'] as List?) ?? const [];
-      if (execution['ok'] != true) {
-        String detail = '';
-        for (final item in results) {
-          if (item is Map && item['result'] is Map) {
-            final x = Map<String, dynamic>.from(item['result'] as Map);
-            detail = (x['speak'] ?? x['error'] ?? '').toString().trim();
-            if (detail.isNotEmpty) break;
-          }
-        }
-        final message = detail.isNotEmpty ? detail : (language == 'fa' ? 'اجرای دستور با مشکل روبه‌رو شد.' : 'The command could not be completed.');
-        _pushChat(message, fromUser: false, provider: 'executor');
-        await _speak(message, language);
-        return;
-      }
-      final chunks = <String>[];
-      for (final item in results) {
-        if (item is Map && item['result'] is Map) {
-          final x = Map<String, dynamic>.from(item['result'] as Map);
-          final t = (x['speak'] ?? '').toString().trim();
-          if (t.isNotEmpty) chunks.add(t);
-        }
-      }
-      final reply = (plan['reply'] ?? '').toString().trim();
-      final spoken = chunks.isNotEmpty ? chunks.join('. ') : reply;
-      if (spoken.isNotEmpty) {
-        _pushChat(spoken, fromUser: false, provider: response['provider']?.toString());
-        await _speak(spoken, language);
-      }
-      if (mounted) setState(() => status = 'انجام شد');
+      final pending = await _presentResponse(response, language, operationGeneration: generation);
+      if (mounted && generation == _voiceGeneration && !pending) setState(() => status = 'انجام شد');
     } catch (e) {
+      if (!mounted || generation != _voiceGeneration) return;
       _log('Command • $e', category: 'EXECUTOR');
-      await _speak(language == 'fa' ? 'در اجرای درخواست مشکلی پیش آمد.' : 'I could not execute that request.', language);
+      final msg = language == 'fa' ? 'در اجرای درخواست مشکلی پیش آمد.' : 'I could not execute that request.';
+      _pushChat(msg, fromUser: false, provider: 'error');
+      await _speak(msg, language, operationGeneration: generation);
     }
   }
 
-  /// Typed chat: the answer is shown as a bubble AND spoken out loud.
+  /// Typed chat: commands are executed, everything else is answered by the
+  /// local model; the answer is shown as a bubble AND spoken.
   Future<void> _sendChat(String text) async {
     if (text.trim().isEmpty || chatBusy) return;
+    final requestId = '${DateTime.now().microsecondsSinceEpoch}_${_chatGeneration++}';
+    activeChatRequestId = requestId;
+    final generation = _chatGeneration;
     _pushChat(text, fromUser: true);
-    setState(() { chatBusy = true; visualState = SmartisVisualState.thinking; status = 'در حال فکر کردن...'; });
+    setState(() { chatBusy = true; visualState = SmartisVisualState.thinking; status = chatThinking ? 'در حال فکر کردن عمیق...' : 'در حال فکر کردن...'; });
     try {
-      final response = await backend.chat(text, null);
-      final plan = Map<String, dynamic>.from(response['plan'] as Map? ?? const {});
-      final reply = (plan['reply'] ?? '').toString().trim();
-      if (reply.isEmpty) {
-        _pushChat('پاسخی تولید نشد.', fromUser: false);
-      } else {
-        _pushChat(reply, fromUser: false, provider: response['provider']?.toString());
-        final language = RegExp(r'[\u0600-\u06FF]').hasMatch(reply) ? 'fa' : 'en';
-        await _speak(reply, language);
-      }
+      final response = await backend.chat(text, null, requestId, thinking: chatThinking);
+      if (!mounted || generation != _chatGeneration || activeChatRequestId != requestId) return;
+      _log('Route • ${response['mode'] ?? '-'} • ${response['provider'] ?? 'unknown'}', category: 'ROUTER');
+      await _presentResponse(response, null);
     } catch (e) {
-      _log('Chat • $e');
-      _pushChat('ارتباط با Backend برقرار نشد.', fromUser: false);
+      _log('Chat • $e', category: 'CHAT');
+      _pushChat('ارتباط با Backend برقرار نشد یا پاسخ خیلی طول کشید.', fromUser: false, provider: 'error');
     } finally {
-      if (mounted) {
+      if (activeChatRequestId == requestId) activeChatRequestId = null;
+      if (mounted && generation == _chatGeneration) {
         setState(() { chatBusy = false; visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; });
       }
       backend.resumeListening();
+    }
+  }
+
+  Future<void> _stopChat() async {
+    final requestId = activeChatRequestId;
+    _chatGeneration++;
+    activeChatRequestId = null;
+    try { await player.stop(); } catch (_) {}
+    if (requestId != null) {
+      try { await backend.cancelChat(requestId); } catch (_) {}
+    }
+    try { await backend.stopSpeech(); } catch (_) {}
+    if (mounted) {
+      setState(() {
+        chatBusy = false;
+        visualState = SmartisVisualState.listening;
+        status = 'متوقف شد';
+        audioLevel = 0;
+      });
+      _log('Chat stopped by user.', category: 'CHAT');
+    }
+    backend.resumeListening();
+  }
+
+  Future<void> _stopVoice() async {
+    final requestId = activeVoiceRequestId;
+    _voiceGeneration++;
+    activeVoiceRequestId = null;
+    processing = false;
+    try { await player.stop(); } catch (_) {}
+    if (requestId != null) {
+      try { await backend.cancelChat(requestId); } catch (_) {}
+    }
+    try { backend.stopCommand(); } catch (_) {}
+    try { await backend.stopSpeech(); } catch (_) {}
+    if (mounted) {
+      setState(() {
+        processing = false;
+        visualState = SmartisVisualState.listening;
+        status = 'متوقف شد';
+        audioLevel = 0;
+      });
+      _log('Voice operation stopped by user.', category: 'STT');
+    }
+    backend.resumeListening();
+  }
+
+  Future<void> _stopCurrentOperation() async {
+    if (chatBusy) {
+      await _stopChat();
+      return;
+    }
+    if (processing || visualState == SmartisVisualState.speaking) {
+      await _stopVoice();
     }
   }
 
@@ -302,27 +404,107 @@ class _SmartisAppState extends State<SmartisApp> {
   /// re-enabled the microphone mid-speech, so Smartis heard itself and the loop
   /// started. The ceiling is now generous and the backend holds the microphone
   /// as a second line of defence.
-  Future<void> _speak(String text, String? language) async {
+  double _speechVisualLevel(Duration position, Duration duration, String text) {
+    final totalMs = duration.inMilliseconds;
+    if (totalMs <= 0) {
+      return (.48 + .34 * math.sin(position.inMilliseconds / 85.0)).clamp(0.0, 1.0);
+    }
+    final progress = (position.inMilliseconds / totalMs).clamp(0.0, 1.0);
+    final chars = text.runes.toList();
+    if (chars.isEmpty) return .35;
+    final index = (progress * (chars.length - 1)).round().clamp(0, chars.length - 1).toInt();
+    final current = String.fromCharCode(chars[index]);
+    if (RegExp(r'[\s،؛,.!?؟:؛]').hasMatch(current)) {
+      return .16 + .10 * (0.5 + 0.5 * math.sin(progress * 80));
+    }
+    final syllableWave = .5 + .5 * math.sin(
+      position.inMilliseconds / 72.0 + index * .83,
+    );
+    final wordWave = .5 + .5 * math.sin(
+      position.inMilliseconds / 155.0 + index * .31,
+    );
+    return (.30 + .42 * syllableWave + .28 * wordWave).clamp(0.0, 1.0);
+  }
+
+  Future<void> _speak(
+    String text,
+    String? language, {
+    int? operationGeneration,
+  }) async {
     if (!mounted || text.trim().isEmpty) return;
-    setState(() { visualState = SmartisVisualState.speaking; status = 'دارم صحبت می‌کنم...'; audioLevel = 0; });
+    if (operationGeneration != null && operationGeneration != _voiceGeneration) return;
+    setState(() {
+      visualState = SmartisVisualState.speaking;
+      status = 'دارم صحبت می‌کنم...';
+      audioLevel = .25;
+    });
+
     try {
       final result = await backend.speak(text, language);
+      if (!mounted || (operationGeneration != null && operationGeneration != _voiceGeneration)) return;
       final encoded = result['audio_base64']?.toString();
-      if (encoded != null && encoded.isNotEmpty) {
-        // Wait for the audio to actually finish. Capping this (the previous
-        // build used 30 s) is what made the microphone reopen mid-sentence, so
-        // Smartis started hearing its own Wikipedia reading.
-        final completion = player.onPlayerComplete.first;
-        await player.play(BytesSource(base64Decode(encoded), mimeType: result['mime_type']?.toString()));
-        try { await completion; } catch (_) {}
+      if (encoded == null || encoded.isEmpty) return;
+
+      StreamSubscription<Duration>? durationSub;
+      StreamSubscription<Duration>? positionSub;
+      Duration duration = Duration.zero;
+
+      try {
+        durationSub = player.onDurationChanged.listen((value) {
+          duration = value;
+        });
+        positionSub = player.onPositionChanged.listen((position) {
+          if (!mounted || visualState != SmartisVisualState.speaking) return;
+          setState(() {
+            audioLevel = _speechVisualLevel(position, duration, text);
+          });
+        });
+
+        final completion = player.onPlayerComplete.first.timeout(
+          const Duration(seconds: 90),
+        );
+        await player.play(
+          BytesSource(
+            base64Decode(encoded),
+            mimeType: result['mime_type']?.toString(),
+          ),
+        );
+        try {
+          await completion;
+        } catch (_) {}
+      } finally {
+        await durationSub?.cancel();
+        await positionSub?.cancel();
+        if (mounted && visualState == SmartisVisualState.speaking) {
+          setState(() => audioLevel = 0);
+        }
       }
     } catch (e) {
       _log('TTS playback • $e', category: 'SYSTEM');
     }
   }
 
+  Future<void> _gracefulClose() async {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try { await player.stop(); } catch (_) {}
+    try { await backend.cancelChat(activeChatRequestId ?? ''); } catch (_) {}
+    try { await backend.shutdownBackend(); } catch (_) {}
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    await SmartisWindowsWindow.close();
+  }
+
   @override
-  void dispose() { shuttingDown = true; clockTimer?.cancel(); dashboardTimer?.cancel(); player.dispose(); backend.dispose(); super.dispose(); }
+  void dispose() {
+    shuttingDown = true;
+    clockTimer?.cancel();
+    dashboardTimer?.cancel();
+    try { player.stop(); } catch (_) {}
+    unawaited(backend.shutdownBackend());
+    player.dispose();
+    backend.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -373,7 +555,7 @@ class _SmartisAppState extends State<SmartisApp> {
                         return Row(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            SizedBox(width: 340, child: _leftPanel()),
+                            SizedBox(width: 390, child: _leftPanel()),
                             const SizedBox(width: 18),
                             Expanded(child: _orbPanel()),
                             const SizedBox(width: 18),
@@ -413,7 +595,7 @@ class _SmartisAppState extends State<SmartisApp> {
             ),
             const Spacer(),
             IconButton(tooltip: 'بازنشانی میکروفون', onPressed: backend.restartMicrophone, icon: const Icon(Icons.mic_none_rounded, color: gold)),
-            IconButton(tooltip: 'بستن', onPressed: SmartisWindowsWindow.close, icon: const Icon(Icons.close_rounded, color: Colors.white54)),
+            IconButton(tooltip: 'بستن', onPressed: _gracefulClose, icon: const Icon(Icons.close_rounded, color: Colors.white54)),
           ],
         ),
       );
@@ -434,7 +616,7 @@ class _SmartisAppState extends State<SmartisApp> {
                   FittedBox(
                     fit: BoxFit.contain,
                     child: Transform.scale(
-                      scale: 1.08,
+                      scale: 1.28,
                       child: SmartisOrb(state: visualState, level: audioLevel),
                     ),
                   ),
@@ -498,9 +680,15 @@ class _SmartisAppState extends State<SmartisApp> {
                 ? SmartisLogPanel(entries: techLogs, connected: backendConnected)
                 : SmartisChatPanel(
                     messages: chat,
-                    busy: chatBusy,
+                    busy: chatBusy || processing || visualState == SmartisVisualState.speaking,
+                    thinking: chatThinking,
+                    onThinkingChanged: (value) => setState(() => chatThinking = value),
                     onSend: _sendChat,
+                    onStop: _stopCurrentOperation,
                     onMic: backend.restartMicrophone,
+                    onCopyMessage: _copyChatMessage,
+                    onConfirm: () => _sendChat('بله'),
+                    onCancel: () => _sendChat('لغو'),
                   ),
           ),
         ],

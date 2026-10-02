@@ -1,32 +1,109 @@
 import 'package:flutter/material.dart';
 
+class _TopDownBrainIcon extends StatelessWidget {
+  final double size;
+  final Color color;
+  const _TopDownBrainIcon({this.size = 24, this.color = const Color(0xFFFFD700)});
+  @override
+  Widget build(BuildContext context) => CustomPaint(size: Size.square(size), painter: _TopDownBrainPainter(color));
+}
+
+class _TopDownBrainPainter extends CustomPainter {
+  final Color color;
+  _TopDownBrainPainter(this.color);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = size.width * .095
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final w = size.width, h = size.height;
+    final left = Path()
+      ..moveTo(w*.49,h*.12)
+      ..cubicTo(w*.31,h*.04,w*.12,h*.15,w*.14,h*.36)
+      ..cubicTo(w*.02,h*.57,w*.13,h*.78,w*.30,h*.86)
+      ..cubicTo(w*.39,h*.91,w*.47,h*.83,w*.49,h*.70);
+    final right = Path()
+      ..moveTo(w*.51,h*.12)
+      ..cubicTo(w*.69,h*.04,w*.88,h*.15,w*.86,h*.36)
+      ..cubicTo(w*.98,h*.57,w*.87,h*.78,w*.70,h*.86)
+      ..cubicTo(w*.61,h*.91,w*.53,h*.83,w*.51,h*.70);
+    canvas.drawPath(left,p);
+    canvas.drawPath(right,p);
+    final mid = Paint()
+      ..color=color
+      ..style=PaintingStyle.stroke
+      ..strokeWidth=size.width*.07
+      ..strokeCap=StrokeCap.round;
+    final l1=Path()
+      ..moveTo(w*.42,h*.20)
+      ..cubicTo(w*.34,h*.28,w*.44,h*.34,w*.36,h*.42)
+      ..cubicTo(w*.29,h*.49,w*.39,h*.56,w*.31,h*.66);
+    final l2=Path()
+      ..moveTo(w*.27,h*.24)
+      ..cubicTo(w*.20,h*.32,w*.31,h*.38,w*.22,h*.47)
+      ..cubicTo(w*.18,h*.52,w*.25,h*.58,w*.23,h*.65);
+    final r1=Path()
+      ..moveTo(w*.58,h*.20)
+      ..cubicTo(w*.66,h*.28,w*.56,h*.34,w*.64,h*.42)
+      ..cubicTo(w*.71,h*.49,w*.61,h*.56,w*.69,h*.66);
+    final r2=Path()
+      ..moveTo(w*.73,h*.24)
+      ..cubicTo(w*.80,h*.32,w*.69,h*.38,w*.78,h*.47)
+      ..cubicTo(w*.82,h*.52,w*.75,h*.58,w*.77,h*.65);
+    canvas.drawPath(l1,mid);
+    canvas.drawPath(l2,mid);
+    canvas.drawPath(r1,mid);
+    canvas.drawPath(r2,mid);
+  }
+  @override bool shouldRepaint(covariant _TopDownBrainPainter oldDelegate)=>oldDelegate.color!=color;
+}
+
 class SmartisChatMessage {
   final String text;
   final bool fromUser;
   final String time;
   final String? provider;
+  final bool confirm;
 
   const SmartisChatMessage({
     required this.text,
     required this.fromUser,
     this.time = '',
     this.provider,
+    this.confirm = false,
   });
 }
 
-/// Typed-chat surface: message bubbles plus a Telegram-style composer.
+/// ChatGPT-style chat surface. The busy indicator lives INSIDE the message
+/// stream, immediately after the latest user bubble, then disappears when the
+/// actual Smartis response is inserted.
 class SmartisChatPanel extends StatefulWidget {
   final List<SmartisChatMessage> messages;
   final bool busy;
+  final bool thinking;
+  final ValueChanged<bool>? onThinkingChanged;
   final void Function(String text) onSend;
   final VoidCallback? onMic;
+  final VoidCallback? onStop;
+  final ValueChanged<String>? onCopyMessage;
+  final VoidCallback? onConfirm;
+  final VoidCallback? onCancel;
 
   const SmartisChatPanel({
     super.key,
     required this.messages,
     required this.onSend,
     this.busy = false,
+    this.thinking = false,
+    this.onThinkingChanged,
     this.onMic,
+    this.onStop,
+    this.onCopyMessage,
+    this.onConfirm,
+    this.onCancel,
   });
 
   @override
@@ -53,7 +130,7 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
   @override
   void didUpdateWidget(covariant SmartisChatPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.messages.length != oldWidget.messages.length) {
+    if (widget.messages.length != oldWidget.messages.length || widget.busy != oldWidget.busy) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _toBottom());
     }
   }
@@ -62,9 +139,18 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
     if (!_scroll.hasClients) return;
     _scroll.animateTo(
       _scroll.position.maxScrollExtent,
-      duration: const Duration(milliseconds: 260),
+      duration: const Duration(milliseconds: 180),
       curve: Curves.easeOut,
     );
+  }
+
+  /// Edit means: load the old text into the composer ONLY. The original
+  /// bubble remains untouched, and pressing Send creates a new turn.
+  void _editMessage(String text) {
+    _controller.text = text;
+    _controller.selection = TextSelection.collapsed(offset: _controller.text.length);
+    setState(() => _canSend = text.trim().isNotEmpty);
+    _focus.requestFocus();
   }
 
   void _submit() {
@@ -96,16 +182,20 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
         children: [
           _header(),
           Expanded(
-            child: widget.messages.isEmpty
+            child: widget.messages.isEmpty && !widget.busy
                 ? _empty()
                 : ListView.builder(
                     controller: _scroll,
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                    itemCount: widget.messages.length,
-                    itemBuilder: (context, index) => _bubble(widget.messages[index]),
+                    padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
+                    itemCount: widget.messages.length + (widget.busy ? 1 : 0),
+                    itemBuilder: (context, index) {
+                      if (widget.busy && index == widget.messages.length) {
+                        return _typingBubble();
+                      }
+                      return _bubble(widget.messages[index], index == widget.messages.length - 1);
+                    },
                   ),
           ),
-          if (widget.busy) _typing(),
           _composer(),
         ],
       ),
@@ -113,19 +203,22 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
   }
 
   Widget _header() => Padding(
-        padding: const EdgeInsets.fromLTRB(18, 16, 18, 10),
+        padding: const EdgeInsets.fromLTRB(18, 14, 18, 8),
         child: Row(
           children: [
             Container(
-              width: 34,
-              height: 34,
+              width: 38,
+              height: 38,
+              padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                gradient: RadialGradient(colors: [Colors.white, gold, gold.withOpacity(.15)]),
-                boxShadow: [BoxShadow(color: gold.withOpacity(.35), blurRadius: 14)],
+                color: gold.withOpacity(.08),
+                border: Border.all(color: gold.withOpacity(.45)),
+                boxShadow: [BoxShadow(color: gold.withOpacity(.22), blurRadius: 14)],
               ),
+              child: const _TopDownBrainIcon(size: 22),
             ),
-            const SizedBox(width: 11),
+            const SizedBox(width: 10),
             const Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -137,13 +230,13 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
               ),
             ),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
               decoration: BoxDecoration(
                 color: const Color(0xFF2ECC71).withOpacity(.12),
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(color: const Color(0xFF2ECC71).withOpacity(.4)),
               ),
-              child: const Text('ONLINE', style: TextStyle(color: Color(0xFF2ECC71), fontSize: 9, letterSpacing: 1, fontWeight: FontWeight.w700)),
+              child: const Text('LOCAL', style: TextStyle(color: Color(0xFF2ECC71), fontSize: 9, letterSpacing: 1, fontWeight: FontWeight.w700)),
             ),
           ],
         ),
@@ -162,23 +255,40 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
         ),
       );
 
-  Widget _typing() => Padding(
-        padding: const EdgeInsets.only(left: 24, bottom: 6),
-        child: Row(
-          children: [
-            SizedBox(
-              width: 13,
-              height: 13,
-              child: CircularProgressIndicator(strokeWidth: 1.6, color: gold.withOpacity(.8)),
+  Widget _typingBubble() => Align(
+        alignment: Alignment.centerLeft,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 560),
+          margin: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+          decoration: BoxDecoration(
+            color: const Color(0xFF121216),
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(16),
+              topRight: Radius.circular(16),
+              bottomRight: Radius.circular(16),
+              bottomLeft: Radius.circular(4),
             ),
-            const SizedBox(width: 9),
-            const Text('Smartis در حال نوشتن...', style: TextStyle(color: Colors.white38, fontSize: 11)),
-          ],
+            border: Border.all(color: Colors.white.withOpacity(.08)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 13,
+                height: 13,
+                child: CircularProgressIndicator(strokeWidth: 1.6, color: gold.withOpacity(.8)),
+              ),
+              const SizedBox(width: 9),
+              const Text('Smartis در حال نوشتن است…', style: TextStyle(color: Colors.white38, fontSize: 11.5)),
+            ],
+          ),
         ),
       );
 
-  Widget _bubble(SmartisChatMessage message) {
+  Widget _bubble(SmartisChatMessage message, bool isLast) {
     final user = message.fromUser;
+    final showConfirm = message.confirm && isLast && !widget.busy && (widget.onConfirm != null || widget.onCancel != null);
     final bubbleColor = user ? gold.withOpacity(.14) : const Color(0xFF121216);
     final borderColor = user ? gold.withOpacity(.45) : Colors.white.withOpacity(.08);
     return Align(
@@ -202,9 +312,11 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
           children: [
             Text(
               message.text,
-              textDirection: TextDirection.rtl,
+              textDirection: _messageDirection(message.text),
+              textAlign: _messageDirection(message.text) == TextDirection.rtl ? TextAlign.right : TextAlign.left,
               style: const TextStyle(color: Color(0xFFEDEDEF), fontSize: 13, height: 1.65),
             ),
+            if (showConfirm) _confirmRow(),
             const SizedBox(height: 5),
             Row(
               mainAxisSize: MainAxisSize.min,
@@ -214,8 +326,27 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
                 const SizedBox(width: 8),
                 Text(message.time, style: const TextStyle(color: Colors.white24, fontSize: 9)),
                 if (user) ...[
-                  const SizedBox(width: 5),
+                  const SizedBox(width: 7),
+                  _messageAction(
+                    icon: Icons.edit_rounded,
+                    tooltip: 'ویرایش و ارسال دوباره',
+                    onTap: widget.busy ? null : () => _editMessage(message.text),
+                  ),
+                  const SizedBox(width: 3),
+                  _messageAction(
+                    icon: Icons.content_copy_rounded,
+                    tooltip: 'کپی پیام',
+                    onTap: widget.onCopyMessage == null ? null : () => widget.onCopyMessage!(message.text),
+                  ),
+                  const SizedBox(width: 4),
                   Icon(Icons.done_all_rounded, size: 12, color: gold.withOpacity(.75)),
+                ] else if (widget.onCopyMessage != null) ...[
+                  const SizedBox(width: 7),
+                  _messageAction(
+                    icon: Icons.content_copy_rounded,
+                    tooltip: 'کپی پاسخ',
+                    onTap: () => widget.onCopyMessage!(message.text),
+                  ),
                 ],
               ],
             ),
@@ -225,65 +356,189 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
     );
   }
 
-  Widget _composer() => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+
+  TextDirection _messageDirection(String text) =>
+      RegExp(r'[\u0600-\u06FF]').hasMatch(text) ? TextDirection.rtl : TextDirection.ltr;
+
+  Widget _confirmRow() => Padding(
+        padding: const EdgeInsets.only(top: 8),
         child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            _sendButton(),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Container(
-                height: 50,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF111114),
-                  borderRadius: BorderRadius.circular(26),
-                  border: Border.all(color: gold.withOpacity(.20)),
-                ),
-                child: Row(
-                  children: [
-                    const SizedBox(width: 16),
-                    Expanded(
-                      child: TextField(
-                        controller: _controller,
-                        focusNode: _focus,
-                        textInputAction: TextInputAction.send,
-                        onSubmitted: (_) => _submit(),
-                        textDirection: TextDirection.rtl,
-                        style: const TextStyle(color: Colors.white, fontSize: 13),
-                        decoration: const InputDecoration(
-                          isDense: true,
-                          border: InputBorder.none,
-                          hintText: 'دستور صوتی یا متنی را تایپ کنید (مثال: گوگل رو باز کن بعد صدا رو روی ۲۰ درصد بذار)...',
-                          hintStyle: TextStyle(color: Colors.white30, fontSize: 11.5),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      tooltip: 'جست‌وجو',
-                      onPressed: () {},
-                      icon: Icon(Icons.search_rounded, color: gold.withOpacity(.85), size: 21),
-                    ),
-                    const SizedBox(width: 4),
-                  ],
-                ),
-              ),
-            ),
-            if (widget.onMic != null) ...[
-              const SizedBox(width: 9),
-              _micButton(),
-            ],
+            _confirmButton('تأیید', Icons.check_rounded, const Color(0xFF2ECC71), widget.onConfirm),
+            const SizedBox(width: 8),
+            _confirmButton('لغو', Icons.close_rounded, Colors.redAccent, widget.onCancel),
           ],
         ),
       );
 
-  /// Telegram-style circular send button with a paper-plane icon.
+  Widget _confirmButton(String label, IconData icon, Color color, VoidCallback? onTap) => InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: color.withOpacity(.12),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: color.withOpacity(.55)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 14, color: color),
+              const SizedBox(width: 5),
+              Text(label, style: TextStyle(color: color, fontSize: 11.5, fontWeight: FontWeight.w700)),
+            ],
+          ),
+        ),
+      );
+
+  Widget _messageAction({required IconData icon, required String tooltip, VoidCallback? onTap}) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Icon(icon, size: 14, color: onTap == null ? Colors.white12 : Colors.white38),
+        ),
+      ),
+    );
+  }
+
+  Widget _composer() => Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 14),
+        child: Container(
+          height: 54,
+          padding: const EdgeInsets.symmetric(horizontal: 5),
+          decoration: BoxDecoration(
+            color: const Color(0xFF111114),
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: gold.withOpacity(.18)),
+          ),
+          child: Row(
+            children: [
+              _composerIcon(
+                icon: Icons.add_rounded,
+                tooltip: 'گزینه‌های بیشتر',
+                color: Colors.white54,
+                onTap: () {
+                  _focus.requestFocus();
+                },
+              ),
+              const SizedBox(width: 3),
+              Expanded(
+                child: TextField(
+                  controller: _controller,
+                  focusNode: _focus,
+                  readOnly: widget.busy,
+                  textInputAction: TextInputAction.send,
+                  onSubmitted: (_) => _submit(),
+                  textDirection: TextDirection.rtl,
+                  textAlign: TextAlign.right,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: InputBorder.none,
+                    hintText: 'پیام یا دستور بنویس…',
+                    hintStyle: TextStyle(color: Colors.white30, fontSize: 11.5),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 3),
+              _thinkingButton(),
+              if (widget.onMic != null) ...[
+                const SizedBox(width: 3),
+                _composerIcon(
+                  icon: Icons.mic_rounded,
+                  tooltip: 'بازنشانی میکروفون',
+                  color: gold,
+                  onTap: widget.onMic,
+                ),
+              ],
+              const SizedBox(width: 3),
+              _sendButton(),
+            ],
+          ),
+        ),
+      );
+
+  Widget _thinkingButton() {
+    final active = widget.thinking;
+    return Tooltip(
+      message: active ? 'فکر کردن فعال' : 'فکر کردن غیرفعال',
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: active ? gold.withOpacity(.13) : Colors.transparent,
+          border: Border.all(color: active ? gold.withOpacity(.55) : Colors.white.withOpacity(.10)),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: widget.busy ? null : (widget.onThinkingChanged == null ? null : () => widget.onThinkingChanged!(!active)),
+            child: Center(child: _TopDownBrainIcon(size: 18, color: active ? gold : Colors.white38)),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _composerIcon({required IconData icon, required String tooltip, required Color color, required VoidCallback? onTap}) {
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox(
+        width: 36,
+        height: 36,
+        child: Material(
+          color: Colors.transparent,
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onTap,
+            child: Icon(icon, size: 21, color: onTap == null ? Colors.white.withOpacity(.20) : color),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _sendButton() {
+    if (widget.busy && widget.onStop != null) {
+      return Tooltip(
+        message: 'توقف',
+        child: Container(
+          width: 42,
+          height: 42,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: const Color(0xFF2A1717),
+            border: Border.all(color: Colors.redAccent.withOpacity(.55)),
+            boxShadow: [BoxShadow(color: Colors.redAccent.withOpacity(.18), blurRadius: 14)],
+          ),
+          child: Material(
+            color: Colors.transparent,
+            shape: const CircleBorder(),
+            child: InkWell(
+              customBorder: const CircleBorder(),
+              onTap: widget.onStop,
+              child: const Icon(Icons.stop_rounded, size: 23, color: Colors.redAccent),
+            ),
+          ),
+        ),
+      );
+    }
     final active = _canSend && !widget.busy;
     return AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      width: 50,
-      height: 50,
+      duration: const Duration(milliseconds: 160),
+      width: 42,
+      height: 42,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         gradient: LinearGradient(
@@ -293,10 +548,8 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
               ? const [Color(0xFFFFE55C), Color(0xFFF0B400)]
               : const [Color(0xFF1A1A1F), Color(0xFF141418)],
         ),
-        border: Border.all(color: active ? Colors.transparent : gold.withOpacity(.25)),
-        boxShadow: active
-            ? [BoxShadow(color: gold.withOpacity(.42), blurRadius: 18, spreadRadius: 1)]
-            : null,
+        border: Border.all(color: active ? Colors.transparent : gold.withOpacity(.20)),
+        boxShadow: active ? [BoxShadow(color: gold.withOpacity(.36), blurRadius: 14)] : null,
       ),
       child: Material(
         color: Colors.transparent,
@@ -306,33 +559,10 @@ class _SmartisChatPanelState extends State<SmartisChatPanel> {
           onTap: active ? _submit : null,
           child: Transform.translate(
             offset: const Offset(-1.5, 0),
-            child: Icon(
-              Icons.send_rounded,
-              size: 22,
-              color: active ? const Color(0xFF14140A) : Colors.white24,
-            ),
+            child: Icon(Icons.arrow_upward_rounded, size: 23, color: active ? const Color(0xFF14140A) : Colors.white24),
           ),
         ),
       ),
     );
   }
-
-  Widget _micButton() => Container(
-        width: 50,
-        height: 50,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: const Color(0xFF111114),
-          border: Border.all(color: gold.withOpacity(.22)),
-        ),
-        child: Material(
-          color: Colors.transparent,
-          shape: const CircleBorder(),
-          child: InkWell(
-            customBorder: const CircleBorder(),
-            onTap: widget.onMic,
-            child: const Icon(Icons.mic_rounded, color: gold, size: 21),
-          ),
-        ),
-      );
 }

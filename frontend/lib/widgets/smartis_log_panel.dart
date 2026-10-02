@@ -25,6 +25,9 @@ class SmartisLogEntry {
     'PLANNER',
     'STT',
     'CONFIRMATION',
+    'ROUTER',
+    'CHAT',
+    'OLLAMA',
   ];
 
   static Color colorFor(String category) {
@@ -43,6 +46,12 @@ class SmartisLogEntry {
         return const Color(0xFF64B5F6);
       case 'CONFIRMATION':
         return const Color(0xFFFFC400);
+      case 'ROUTER':
+        return const Color(0xFF26C6DA);
+      case 'CHAT':
+        return const Color(0xFF80CBC4);
+      case 'OLLAMA':
+        return const Color(0xFFEF9A9A);
       default:
         return const Color(0xFFFFD700);
     }
@@ -83,6 +92,17 @@ class _SmartisLogPanelState extends State<SmartisLogPanel> {
     return list.where((e) => e.category.toUpperCase() == _filter).toList().reversed.toList();
   }
 
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message, style: const TextStyle(fontSize: 12)),
+        duration: const Duration(milliseconds: 1400),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
   void _copy(SmartisLogEntry entry) {
     final buffer = StringBuffer()
       ..writeln('[${entry.time}] [${entry.category}] ${entry.message}');
@@ -90,14 +110,34 @@ class _SmartisLogPanelState extends State<SmartisLogPanel> {
       buffer.writeln(entry.detail);
     }
     Clipboard.setData(ClipboardData(text: buffer.toString()));
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('کپی شد', style: TextStyle(fontSize: 12)),
-        duration: Duration(milliseconds: 900),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
+    _toast('کپی شد');
+  }
+
+  /// Copies the WHOLE log (every category, oldest first) as plain text,
+  /// including each entry's technical detail, ready to paste into a bug report.
+  void _copyAll() {
+    final list = widget.entries;
+    if (list.isEmpty) {
+      _toast('لاگی برای کپی وجود ندارد');
+      return;
+    }
+    final buffer = StringBuffer()
+      ..writeln('=== Smartis log export ===')
+      ..writeln('Exported : ${DateTime.now().toIso8601String()}')
+      ..writeln('Backend  : ${widget.connected ? 'connected' : 'disconnected'}')
+      ..writeln('Entries  : ${list.length}')
+      ..writeln('==========================');
+    for (final e in list) {
+      buffer.writeln('[${e.time}] [${e.category}] ${e.message}');
+      final detail = e.detail;
+      if (detail != null && detail.trim().isNotEmpty) {
+        for (final line in detail.split('\n')) {
+          buffer.writeln('    $line');
+        }
+      }
+    }
+    Clipboard.setData(ClipboardData(text: buffer.toString()));
+    _toast('کل لاگ کپی شد (${list.length} رویداد)');
   }
 
   @override
@@ -147,6 +187,8 @@ class _SmartisLogPanelState extends State<SmartisLogPanel> {
             const Expanded(
               child: Text(
                 'پنل لاگ‌های فنی (Technical Logs)',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 textAlign: TextAlign.right,
                 style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800, fontSize: 13.5),
               ),
@@ -167,6 +209,29 @@ class _SmartisLogPanelState extends State<SmartisLogPanel> {
                   const SizedBox(width: 5),
                   const Text('رویداد', style: TextStyle(color: Colors.white54, fontSize: 10)),
                 ],
+              ),
+            ),
+            Tooltip(
+              message: 'کپی کل لاگ (همهٔ دسته‌ها، همراه جزئیات)',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(18),
+                onTap: _copyAll,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: gold.withOpacity(.12),
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: gold.withOpacity(.45)),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.copy_all_rounded, color: gold, size: 15),
+                      SizedBox(width: 5),
+                      Text('کپی کل لاگ', style: TextStyle(color: gold, fontSize: 10.5, fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                ),
               ),
             ),
             IconButton(

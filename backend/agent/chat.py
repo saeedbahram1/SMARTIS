@@ -1,68 +1,123 @@
 from __future__ import annotations
 
-"""Conversational layer for Smartis — "answer everything" behaviour.
+"""Conversational layer for Smartis.
 
-Why this file exists
---------------------
-The previous build had a hard gap: anything the deterministic fast-path did not
-recognise fell through to a dead-end message ("I did not understand, try
-again"). That is what made Smartis feel like a broken bot instead of an
-assistant.
+This module only answers CONVERSATION. Anything that is a command (open an app,
+volume, files, power, weather, research ...) is decided earlier by
+``agent.router`` and never reaches the language model as chat.
 
-This module closes that gap. Every utterance that is not a Windows action is
-answered like a human would answer it.
-
-Cost: zero. Everything runs on the SAME local Ollama model that already powers
-the planner (`OLLAMA_MODEL`, default `qwen2.5:7b`). No OpenAI / Gemini / any
-paid cloud API is used or required.
-
-Degradation ladder (never a dead end):
-    1. local Ollama chat completion        -> "chat-local"
-    2. Wikipedia / public web research     -> "chat-research"
-    3. warm human-style holding reply      -> "chat-offline"
+2.13 changes
+------------
+* All Ollama traffic goes through ``agent.llm`` (same ``num_ctx`` and
+  ``keep_alive`` as the planner and the warm-up) -> the model is no longer
+  reloaded on every request and the "model is not up" false alarm is gone.
+* No pre-flight residency gate. Ollama loads the model on demand; if the
+  request fails the REAL error is reported.
+* Real answers: proper system prompt, recent conversation as chat history,
+  400-token budget (the old 16/24-token cap cut every answer in half).
+* Streaming with a wall-clock budget: a slow machine still returns the text
+  produced so far instead of an error.
 """
 
 import re
 import threading
+import uuid
+from datetime import datetime
 from typing import Any
 
-import requests
-
+from agent import llm
+from agent.logbus import logbus
+from agent.ollama_model import ensure_ollama, resolve_model
 from config import (
     CHAT_KEEP_MODEL_WARM,
     CHAT_MAX_REPLY_CHARS,
     CHAT_MAX_TOKENS,
-    CHAT_MODEL,
     CHAT_TEMPERATURE,
+    CHAT_THINK_MAX_TOKENS,
     CHAT_TIMEOUT,
-    OLLAMA_URL,
 )
 
 _PERSIAN = re.compile(r"[\u0600-\u06FF]")
 _LATIN = re.compile(r"[A-Za-z]")
+_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_CANCEL_LOCK = threading.Lock()
+_WARM_LOCK = threading.Lock()
 
-SYSTEM_PROMPT = r"""
-تو «Smartis» هستی؛ یک دستیار صوتی فارسی‌زبان روی ویندوز، ساخته‌شده توسط تیم سعید بهرامی.
-تو مثل یک انسان واقعی، باهوش، گرم و خودی حرف می‌زنی — نه مثل یک ربات پشتیبانی.
 
-قواعد گفتگو (خیلی مهم):
-1. به هر پیام کاربر جواب بده. هرگز نگو «متوجه نشدم»، «دوباره امتحان کن»، «نمی‌توانم»، «مشخص نیست» یا جملات کلیشه‌ای مشابه.
-2. اگر بخشی از حرف کاربر مبهم بود، محتمل‌ترین برداشت را انتخاب کن، جواب بده و در صورت نیاز یک سؤال کوتاه و طبیعی بپرس.
-3. زبان پاسخ را دقیقاً با زبان کاربر هماهنگ کن: فارسی → فارسی روان و محاوره‌ای، انگلیسی → انگلیسی روان.
-4. پاسخ‌ها باید قابل خواندن با صدا باشند: معمولاً ۱ تا ۴ جمله. از مارک‌داون، بولت، ستاره، هشتگ و ایموجی استفاده نکن.
-5. عددها، درصد و واحدها را همان‌طور که باید خوانده شوند بنویس (مثال: «۲۰ درصد»).
-6. اگر سؤال دانشی پرسید، دقیق و صادقانه جواب بده. اگر واقعاً نمی‌دانی، صریح بگو که دقیق مطمئن نیستی و بهترین حدس یا راهنمایی را بده.
-7. تو دستیار سیستم هم هستی: می‌توانی برنامه باز کنی، صدا را کم و زیاد کنی، موسیقی پخش کنی، فایل بسازی، آب‌وهوا و اخبار بگویی.
-   اما در همین پاسخ فقط حرف بزن؛ سیستم فرمان‌ها را جداگانه اجرا می‌کند. لازم نیست بگویی «در حال اجرا».
-8. هیچ‌وقت ادعا نکن کاری را انجام داده‌ای که انجام نشده.
-9. اگر کاربر شوخی کرد، با همان لحن گرم و کمی طنز جواب بده. خشک و اداری نباش.
-10. معرفی خودت: «من Smartis هستم» و سازنده‌ات «تیم سعید بهرامی» است.
-11. از گفتن «به عنوان یک هوش مصنوعی...» پرهیز کن. طبیعی و انسانی حرف بزن.
-"""
+# --------------------------------------------------------------------------
+# Cancellation (unchanged public API)
+# --------------------------------------------------------------------------
+def create_request_id() -> str:
+    request_id = uuid.uuid4().hex
+    with _CANCEL_LOCK:
+        _CANCEL_EVENTS[request_id] = threading.Event()
+    return request_id
 
-_MARKDOWN_NOISE = re.compile(r"(\*\*|__|`{1,3}|^#{1,6}\s*|^\s*[-*•]\s+)", re.M)
+
+def register_request(request_id: str | None) -> None:
+    """Make sure a client-supplied request id can be cancelled."""
+    if not request_id:
+        return
+    with _CANCEL_LOCK:
+        _CANCEL_EVENTS.setdefault(str(request_id), threading.Event())
+
+
+def cancel_request(request_id: str) -> bool:
+    with _CANCEL_LOCK:
+        event = _CANCEL_EVENTS.get(str(request_id))
+        if event is None:
+            return False
+        event.set()
+        return True
+
+
+def _request_cancelled(request_id: str | None) -> bool:
+    if not request_id:
+        return False
+    with _CANCEL_LOCK:
+        event = _CANCEL_EVENTS.get(str(request_id))
+        return bool(event and event.is_set())
+
+
+def _finish_request(request_id: str | None) -> None:
+    if not request_id:
+        return
+    with _CANCEL_LOCK:
+        _CANCEL_EVENTS.pop(str(request_id), None)
+
+
+# --------------------------------------------------------------------------
+# Prompt
+# --------------------------------------------------------------------------
+_FA_DAYS = ("دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه")
+
+_SYSTEM_FA = """تو Smartis هستی؛ دستیار هوشمند و صمیمی ویندوز که تیم سعید بهرامی ساخته است.
+شخصیت: دقیق، گرم، مستقیم؛ مثل یک دوست کاربلد صحبت کن، نه مثل ربات.
+قواعد پاسخ:
+- دقیقاً به زبان کاربر جواب بده (فارسی یا English). فارسی را روان و معیار بنویس.
+- پرسش ساده: یک تا سه جمله. پرسش علمی/فنی/توضیحی: کامل ولی فشرده، حداکثر چند پاراگراف کوتاه یا فهرست مرتب.
+- اول جواب اصلی را بده، بعد در صورت نیاز توضیح. مقدمه، تعارف و تکرار سؤال ممنوع.
+- اگر مطمئن نیستی یا اطلاعاتت قدیمی است، صادقانه بگو؛ حدس را به‌عنوان واقعیت ارائه نکن. عدد، تاریخ و نام را نساز.
+- به پیام‌های قبلی همین گفتگو توجه کن و ارجاع‌ها («این»، «همون»، «بیشتر توضیح بده») را از روی آن‌ها بفهم.
+- اطلاعات لحظه‌ای (آب‌وهوا، خبر، قیمت، ساعت دقیق) را از خودت نمی‌دانی؛ اگر پرسیدند بگو با دستور مستقیم مثل «هوای تهران» یا «آخرین اخبار» می‌توانی بگیری.
+- هرگز ادعا نکن کاری روی سیستم انجام دادی. اجرای دستورها (باز کردن برنامه، صدا، فایل، خاموش کردن...) مسیر جداگانه‌ای دارد؛ اگر درخواستی شبیه دستور بود و اینجا رسید، بخواه واضح‌تر بگوید.
+- بدون ایموجی و بدون Markdown سنگین (عنوان، جدول). فهرست ساده با خط تیره مجاز است."""
+
+_SYSTEM_EN = """You are Smartis, a smart, friendly Windows assistant built by Saeed Behrami's team.
+Personality: precise, warm, direct - like a capable friend, not a robot.
+Answer rules:
+- Reply in the user's language (English or Persian).
+- Simple question: one to three sentences. Technical/explanatory question: complete but compact, a few short paragraphs or a tidy list at most.
+- Lead with the answer, then explain if needed. No preamble, no filler, no repeating the question.
+- If unsure or if your knowledge may be outdated, say so honestly. Never invent numbers, dates or names.
+- Use the earlier messages of this conversation to resolve references such as "that", "it", "tell me more".
+- You do not know live data (weather, news, prices, exact time); say the user can ask directly, e.g. "weather in Tehran" or "latest news".
+- Never claim you performed an action on the computer. Commands (open apps, volume, files, power...) use a separate path; if a request looks like a command and reached you, ask the user to phrase it more clearly.
+- No emoji and no heavy Markdown (headings, tables). Simple dash lists are fine."""
+
+_MARKDOWN_NOISE = re.compile(r"(\*\*|__|`{1,3}|^#{1,6}\s*)", re.M)
 _MULTI_SPACE = re.compile(r"[ \t\u00a0]+")
-_MULTI_NEWLINE = re.compile(r"\n{2,}")
+_MULTI_NEWLINE = re.compile(r"\n{3,}")
 
 
 def _is_fa(text: str, language: str | None = None) -> bool:
@@ -75,129 +130,169 @@ def _is_fa(text: str, language: str | None = None) -> bool:
 
 
 def _clean(reply: str) -> str:
-    value = str(reply or "").strip()
-    value = _MARKDOWN_NOISE.sub(" ", value)
-    value = _MULTI_NEWLINE.sub(" ", value)
-    value = _MULTI_SPACE.sub(" ", value).strip()
+    value = llm.strip_think(str(reply or ""))
+    value = _MARKDOWN_NOISE.sub("", value)
+    value = "\n".join(_MULTI_SPACE.sub(" ", line).strip() for line in value.splitlines())
+    value = _MULTI_NEWLINE.sub("\n\n", value).strip()
     # Drop a leading label the model sometimes adds on its own.
-    value = re.sub(r"^(?:Smartis|اسمارتیز|دستیار|پاسخ)\s*[:：\-]\s*", "", value, flags=re.I)
+    value = re.sub(r"^(?:Smartis|اسمارتیز|دستیار|پاسخ|Assistant)\s*[:：\-]\s*", "", value, flags=re.I)
     if len(value) > CHAT_MAX_REPLY_CHARS:
         cut = value[:CHAT_MAX_REPLY_CHARS]
-        stop = max(cut.rfind("."), cut.rfind("؟"), cut.rfind("!"), cut.rfind("،"))
+        stop = max(cut.rfind("."), cut.rfind("؟"), cut.rfind("!"), cut.rfind("؛"), cut.rfind("\n"))
         value = cut[: stop + 1] if stop > 200 else cut
     return value.strip()
 
 
-def _ollama_reply(text: str, language: str, context: str = "") -> str | None:
-    instruction = (
-        "\nDETECTED LANGUAGE=Persian. پاسخ باید کاملاً فارسی و روان باشد."
-        if language == "fa"
-        else "\nDETECTED LANGUAGE=English. The reply MUST be fluent English."
-    )
-    messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT + instruction}]
-    if context:
-        messages.append(
-            {
-                "role": "system",
-                "content": "RECENT LOCAL CONVERSATION (use it for follow-ups):\n" + str(context)[:2000],
-            }
-        )
-    messages.append({"role": "user", "content": text})
+def _system_prompt(lang: str, thinking: bool) -> str:
+    now = datetime.now()
+    if lang == "fa":
+        stamp = f"اکنون: {_FA_DAYS[now.weekday()]} {now:%Y-%m-%d} ساعت {now:%H:%M} (زمان سیستم کاربر)."
+        tail = "\nزبان پاسخ: فارسی."
+        extra = "\nاین پرسش نیاز به استدلال دارد؛ درست فکر کن و جواب نهایی را کامل بده." if thinking else ""
+        return f"{_SYSTEM_FA}\n{stamp}{extra}{tail}"
+    stamp = f"Now: {now:%A %Y-%m-%d %H:%M} (the user's system time)."
+    extra = "\nThis question needs reasoning; think it through, then give the full final answer." if thinking else ""
+    return f"{_SYSTEM_EN}\n{stamp}{extra}\nReply language: English."
 
-    payload: dict[str, Any] = {
-        "model": CHAT_MODEL,
-        "stream": False,
-        "messages": messages,
-        "options": {
-            "temperature": CHAT_TEMPERATURE,
-            "top_p": 0.9,
-            "repeat_penalty": 1.12,
-            "num_predict": CHAT_MAX_TOKENS,
-        },
-    }
-    if not CHAT_KEEP_MODEL_WARM:
-        payload["keep_alive"] = 0
+
+def _history_messages(budget_chars: int = 1500, max_turns: int = 6) -> list[dict[str, str]]:
+    """Recent turns (chat AND commands) as real chat messages, newest kept first."""
+    try:
+        from agent.context_memory import memory
+
+        turns = list(memory.turns)[-max_turns:]
+        fresh = memory._fresh()  # noqa: SLF001 - same package, deliberate
+    except Exception:
+        return []
+    if not fresh:
+        return []
+    picked: list[tuple[str, str]] = []
+    used = 0
+    for turn in reversed(turns):
+        user = str(getattr(turn, "user", "") or "").strip()[:320]
+        reply = str(getattr(turn, "reply", "") or "").strip()[:420]
+        size = len(user) + len(reply)
+        if not user or used + size > budget_chars:
+            break
+        picked.append((user, reply))
+        used += size
+    messages: list[dict[str, str]] = []
+    for user, reply in reversed(picked):
+        messages.append({"role": "user", "content": user})
+        if reply:
+            messages.append({"role": "assistant", "content": reply})
+    return messages
+
+
+# --------------------------------------------------------------------------
+# Errors -> short human message (full error always goes to the log panel)
+# --------------------------------------------------------------------------
+def _human_error(error: str | None, lang: str) -> str:
+    err = str(error or "").lower()
+    if "cannot reach ollama" in err or "connection" in err:
+        fa = "Ollama روشن نیست یا در دسترس نیست. آن را اجرا کن و دوباره بپرس."
+        en = "Ollama is not running or not reachable. Start it and ask again."
+    elif "not found" in err and "model" in err:
+        fa = "مدل انتخاب‌شده روی Ollama نصب نیست؛ با ollama pull آن را نصب کن."
+        en = "The selected model is not installed in Ollama. Install it with ollama pull."
+    elif "no response" in err or "timeout" in err or "stalled" in err:
+        fa = "مدل دیرتر از حد معمول پاسخ داد و نتیجه‌ای نرسید. دوباره امتحان کن؛ معمولاً بار دوم سریع‌تر است."
+        en = "The model took too long and returned nothing. Try again; the second request is usually faster."
+    elif "cancelled" in err:
+        fa, en = "متوقف شد.", "Stopped."
     else:
-        payload["keep_alive"] = "30m"
-
-    try:
-        response = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=CHAT_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        reply = _clean(data.get("message", {}).get("content", ""))
-        return reply or None
-    except Exception:
-        return None
+        fa = "پاسخی از مدل نگرفتم. جزئیات خطا در پنل لاگ (دستهٔ OLLAMA/CHAT) ثبت شده است."
+        en = "I did not get a reply from the model. Details are in the log panel (OLLAMA/CHAT)."
+    return fa if lang == "fa" else en
 
 
-def _knowledge_reply(text: str, language: str) -> str | None:
-    """Wikipedia-first public-web research, used only when the local model fails."""
-    try:
-        from services.research_service import research
-
-        result = research(text, "fa" if language == "fa" else "en")
-    except Exception:
-        return None
-    if not isinstance(result, dict) or result.get("ok") is not True:
-        return None
-    for key in ("answer", "message", "speak", "summary"):
-        value = _clean(result.get(key) or "")
-        if value:
-            return value
-    return None
-
-
-def _holding_reply(language: str) -> str:
-    """Last resort. Still human, still moves the conversation forward."""
-    if language == "fa":
-        return (
-            "الان مدل محلی‌ام بالا نیست، پس نمی‌تونم عمیق فکر کنم؛ ولی هر دستوری روی ویندوز داشتی "
-            "همین لحظه انجام می‌دم. اگر Ollama روشن باشه، همین سؤال را کامل و مفصل جواب می‌دم."
-        )
-    return (
-        "My local model is not running right now, so I cannot think this through properly. "
-        "Any Windows command still works immediately. With Ollama running I can answer this in full."
-    )
-
-
-def respond(text: str, language: str | None = None, context: str = "") -> dict[str, Any]:
-    """Answer any utterance. Always returns ok=True with a non-empty reply."""
+# --------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------
+def respond(
+    text: str,
+    language: str | None = None,
+    context: str = "",
+    request_id: str | None = None,
+    thinking: bool = False,
+) -> dict[str, Any]:
+    """Answer one conversational utterance with the local model."""
+    del context  # history now comes from structured memory, not a text blob
     value = str(text or "").strip()
     if not value:
         return {"ok": False, "reply": "", "provider": "chat"}
 
     lang = "fa" if _is_fa(value, language) else "en"
+    register_request(request_id)
+    try:
+        if _request_cancelled(request_id):
+            return {"ok": False, "cancelled": True, "reply": "", "provider": "chat-cancelled", "error": "cancelled"}
 
-    reply = _ollama_reply(value, lang, context)
-    if reply:
-        return {"ok": True, "reply": reply, "provider": "chat-local"}
+        messages = [{"role": "system", "content": _system_prompt(lang, thinking)}]
+        messages.extend(_history_messages())
+        messages.append({"role": "user", "content": value})
 
-    reply = _knowledge_reply(value, lang)
-    if reply:
-        return {"ok": True, "reply": reply, "provider": "chat-research"}
-
-    return {"ok": True, "reply": _holding_reply(lang), "provider": "chat-offline"}
-
-
-def warm_up() -> None:
-    """Preload the model in the background so the first real answer is fast."""
-    if not CHAT_KEEP_MODEL_WARM:
-        return
-
-    def worker() -> None:
-        try:
-            requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": CHAT_MODEL,
-                    "prompt": "سلام",
-                    "stream": False,
-                    "options": {"num_predict": 1},
-                    "keep_alive": "30m",
-                },
-                timeout=90,
+        def attempt() -> llm.LLMResult:
+            return llm.generate(
+                resolve_model(),
+                messages,
+                num_predict=CHAT_THINK_MAX_TOKENS if thinking else CHAT_MAX_TOKENS,
+                temperature=max(0.2, CHAT_TEMPERATURE) if not thinking else 0.6,
+                think=bool(thinking),
+                total_timeout=CHAT_TIMEOUT * (1.6 if thinking else 1.0),
+                is_cancelled=lambda: _request_cancelled(request_id),
+                label="think" if thinking else "chat",
             )
-        except Exception:
-            pass
 
-    threading.Thread(target=worker, name="smartis-chat-warmup", daemon=True).start()
+        result = attempt()
+        if not result.ok and not result.cancelled and "cannot reach ollama" in str(result.error or "").lower():
+            # Ollama was not running: start it (Windows) and retry once.
+            status = ensure_ollama(force=True)
+            logbus.emit("OLLAMA", "Ollama was unreachable; tried to start it.", str(status)[:300])
+            if status.get("ok"):
+                result = attempt()
+
+        if result.cancelled or _request_cancelled(request_id):
+            return {"ok": False, "cancelled": True, "reply": "", "provider": "chat-cancelled", "error": "cancelled"}
+
+        reply = _clean(result.text) if result.ok else ""
+        if reply:
+            if result.partial:
+                logbus.emit("CHAT", "Reply was cut by the time budget; returned the text produced so far.", result.error)
+            return {
+                "ok": True,
+                "reply": reply,
+                "provider": "chat-local",
+                "thinking": bool(thinking),
+                "elapsed": round(result.total_seconds, 2),
+                "tokens": result.tokens,
+            }
+
+        logbus.emit("CHAT", "Local chat request failed.", str(result.error)[:600])
+        return {
+            "ok": True,
+            "reply": _human_error(result.error, lang),
+            "provider": "chat-error",
+            "error": result.error or "local_model_no_reply",
+            "thinking": bool(thinking),
+        }
+    finally:
+        _finish_request(request_id)
+
+
+def warm_up() -> dict[str, Any]:
+    """Load the model once, with the SAME options chat uses. Never raises."""
+    if not CHAT_KEEP_MODEL_WARM:
+        return {"ok": True, "skipped": True}
+    with _WARM_LOCK:
+        status = ensure_ollama(force=True)
+        if not status.get("ok"):
+            return {"ok": False, "error": "ollama unavailable during warm-up", "status": status}
+        model = resolve_model()
+        result = llm.warm_model(model)
+        return {
+            "ok": result.ok,
+            "model": model,
+            "load_seconds": round(result.load_seconds, 2),
+            "error": result.error,
+        }

@@ -94,6 +94,13 @@ class BackendSocket {
 
   void restartMicrophone() => sendAction('mic_restart');
 
+  void stopCommand() => sendAction('mic_stop_command');
+
+  Future<Map<String, dynamic>> stopSpeech() async {
+    sendAction('speak_stop');
+    return {'ok': true};
+  }
+
   Future<Map<String, dynamic>> _json(http.Response response) async {
     final body = response.body;
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -117,16 +124,22 @@ class BackendSocket {
     );
   }
 
+  /// Voice entry point. Same router as typed chat: a command is executed, a
+  /// confirmation answer is consumed, anything else is answered by the local model.
   Future<Map<String, dynamic>> command(
     String text,
-    String? language,
-  ) async {
+    String? language, {
+    String? requestId,
+    bool thinking = false,
+  }) async {
     return _json(
-      await http.post(
-        Uri.parse('$baseUrl/command'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'text': text, 'language': language}),
-      ),
+      await http
+          .post(
+            Uri.parse('$baseUrl/command'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'text': text, 'language': language, 'request_id': requestId, 'thinking': thinking}),
+          )
+          .timeout(const Duration(minutes: 6)),
     );
   }
 
@@ -134,14 +147,34 @@ class BackendSocket {
   Future<Map<String, dynamic>> chat(
     String text,
     String? language,
-  ) async {
+    String requestId, {
+    bool thinking = false,
+  }) async {
+    return _json(
+      await http
+          .post(
+            Uri.parse('$baseUrl/chat'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'text': text, 'language': language, 'request_id': requestId, 'thinking': thinking}),
+          )
+          .timeout(const Duration(minutes: 6)),
+    );
+  }
+
+  Future<Map<String, dynamic>> cancelChat(String requestId) async {
     return _json(
       await http.post(
-        Uri.parse('$baseUrl/chat'),
+        Uri.parse('$baseUrl/chat/cancel'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'text': text, 'language': language}),
+        body: jsonEncode({'request_id': requestId}),
       ),
     );
+  }
+
+  Future<void> shutdownBackend() async {
+    try {
+      await http.post(Uri.parse('$baseUrl/shutdown')).timeout(const Duration(seconds: 4));
+    } catch (_) {}
   }
 
   Future<Map<String, dynamic>> history() async {
