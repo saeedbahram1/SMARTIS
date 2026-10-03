@@ -30,7 +30,7 @@ from typing import Any, Callable
 import requests
 
 from agent.logbus import logbus
-from config import CHAT_FIRST_TOKEN_TIMEOUT, CHAT_KEEP_MODEL_WARM, OLLAMA_NUM_CTX, OLLAMA_URL
+from config import CHAT_FIRST_TOKEN_TIMEOUT, CHAT_KEEP_MODEL_WARM, OLLAMA_NUM_CTX, OLLAMA_NUM_THREAD, OLLAMA_URL
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
 _THINK_OPEN = re.compile(r"<think>.*$", re.S | re.I)
@@ -51,6 +51,24 @@ class LLMResult:
 
 
 _inflight_lock = threading.Lock()
+
+# Models without a reasoning head (qwen2.5:1.5b, ...) answer HTTP 400 to
+# think=true. The verdict never changes for a given tag, so remember it and skip
+# the doomed round-trip on every later "thinking" request.
+_think_unsupported: set[str] = set()
+_think_lock = threading.Lock()
+
+
+def _think_rejected(model: str) -> bool:
+    key = normalize_model_name(model)
+    with _think_lock:
+        return key in _think_unsupported
+
+
+def _remember_think_unsupported(model: str) -> None:
+    key = normalize_model_name(model)
+    with _think_lock:
+        _think_unsupported.add(key)
 
 
 def keep_alive_value() -> int:
@@ -76,6 +94,8 @@ def _options(num_predict: int, temperature: float, extra: dict[str, Any] | None 
         "num_ctx": OLLAMA_NUM_CTX,  # MUST stay identical for every request
         "num_predict": int(num_predict),
     }
+    if OLLAMA_NUM_THREAD > 0:
+        options["num_thread"] = OLLAMA_NUM_THREAD
     if extra:
         options.update(extra)
     return options
@@ -113,12 +133,15 @@ def generate(
         return payload
 
     attempts: list[bool | None] = [bool(think)]
-    if think:
+    if think and _think_rejected(model):
+        # Already proven unsupported this run: go straight to the plain request.
+        attempts = [None]
+    elif think:
         # A model without thinking support answers HTTP 400 to think=true.
         attempts.append(None)
 
     last_error = "unknown error"
-    for attempt_index, think_flag in enumerate(attempts):
+    for think_flag in attempts:
         text_parts: list[str] = []
         think_parts: list[str] = []
         meta: dict[str, Any] = {}
@@ -134,7 +157,8 @@ def generate(
             if response.status_code >= 400:
                 body = response.text[:500].replace("\n", " ")
                 last_error = f"HTTP {response.status_code}: {body}"
-                if think and attempt_index == 0 and response.status_code == 400 and "think" in body.lower():
+                if think_flag is True and response.status_code == 400 and "think" in body.lower():
+                    _remember_think_unsupported(model)
                     logbus.emit("OLLAMA", "Model does not support thinking; retrying without it.", body)
                     continue
                 return LLMResult(False, error=last_error, total_seconds=time.monotonic() - started)

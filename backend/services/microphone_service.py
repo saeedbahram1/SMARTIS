@@ -44,10 +44,25 @@ class MicrophoneService:
     MIN_SPEECH_BLOCKS = 3  # ~150 ms at the 50 ms audio callback rate
     AUTO_RESUME_PAUSED_SECONDS = 120.0
     LEVEL_MIN_DB = -60.0
+    # Absolute lower bounds of the speech gate. The thresholds actually used at
+    # runtime are derived from the measured ambient noise floor and clamped to
+    # these values, so a quiet room keeps the historical sensitivity while a
+    # noisy room (or Windows AGC pushing the floor up) still endpoints instead
+    # of running every command into COMMAND_MAX_SECONDS.
     SPEECH_START_DB = -54.0
     SPEECH_CONTINUE_DB = -61.0
     SPEECH_START_PEAK_DB = -40.0
     SPEECH_CONTINUE_PEAK_DB = -49.0
+    NOISE_START_MARGIN_DB = 7.0
+    NOISE_CONTINUE_MARGIN_DB = 3.5
+    NOISE_START_PEAK_MARGIN_DB = 12.0
+    NOISE_CONTINUE_PEAK_MARGIN_DB = 8.0
+    NOISE_FLOOR_MIN_DB = -95.0
+    NOISE_FLOOR_MAX_DB = -35.0
+    NOISE_SMOOTHING = 0.06
+    NOISE_PEAK_SMOOTHING = 0.10
+    NOISE_INITIAL_DB = -64.0
+    NOISE_PEAK_INITIAL_DB = -52.0
     PRE_ROLL_BLOCKS = 5
 
     def __init__(self, stt: SherpaService) -> None:
@@ -70,6 +85,35 @@ class MicrophoneService:
         self._last_level_emit = 0.0
         self._last_level = 0.0
         self._pre_roll: deque[np.ndarray] = deque(maxlen=self.PRE_ROLL_BLOCKS)
+        self._noise_db = self.NOISE_INITIAL_DB
+        self._noise_peak_db = self.NOISE_PEAK_INITIAL_DB
+
+    def _speech_start_db(self) -> float:
+        return max(self.SPEECH_START_DB, self._noise_db + self.NOISE_START_MARGIN_DB)
+
+    def _speech_continue_db(self) -> float:
+        return max(self.SPEECH_CONTINUE_DB, self._noise_db + self.NOISE_CONTINUE_MARGIN_DB)
+
+    def _speech_start_peak_db(self) -> float:
+        return max(
+            self.SPEECH_START_PEAK_DB,
+            self._noise_peak_db + self.NOISE_START_PEAK_MARGIN_DB,
+        )
+
+    def _speech_continue_peak_db(self) -> float:
+        return max(
+            self.SPEECH_CONTINUE_PEAK_DB,
+            self._noise_peak_db + self.NOISE_CONTINUE_PEAK_MARGIN_DB,
+        )
+
+    def _update_noise_floor(self, db: float, peak_db: float) -> None:
+        """Adapt the ambient estimate from blocks that are below the gate."""
+        self._noise_db += self.NOISE_SMOOTHING * (db - self._noise_db)
+        self._noise_peak_db += self.NOISE_PEAK_SMOOTHING * (peak_db - self._noise_peak_db)
+        self._noise_db = min(max(self._noise_db, self.NOISE_FLOOR_MIN_DB), self.NOISE_FLOOR_MAX_DB)
+        self._noise_peak_db = min(
+            max(self._noise_peak_db, self.NOISE_FLOOR_MIN_DB), self.NOISE_FLOOR_MAX_DB
+        )
 
     @property
     def running(self) -> bool:
@@ -88,6 +132,8 @@ class MicrophoneService:
             "sample_rate": self._native_sample_rate,
             "error": self._last_error,
             "always_listening": True,
+            "noise_db": round(self._noise_db, 1),
+            "gate_db": round(self._speech_start_db(), 1),
         }
 
     def subscribe(self) -> queue.Queue:
@@ -286,14 +332,19 @@ class MicrophoneService:
     def _process_block(self, block: np.ndarray) -> None:
         if block.size == 0:
             return
-        self._emit_level(block)
-        if self.state == "listening":
-            self._process_command_block(block)
-
-    def _emit_level(self, block: np.ndarray) -> None:
+        # Measure once per block: the level meter and the endpointer need the
+        # same RMS/peak numbers, and computing them twice costs ~20 ms of CPU
+        # per second of audio for no benefit.
         samples = block.astype(np.float32) / 32768.0
-        rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+        rms = float(np.sqrt(np.mean(np.square(samples))))
         db = 20.0 * math.log10(max(rms, 1e-9))
+        peak = float(np.max(np.abs(samples)))
+        peak_db = 20.0 * math.log10(max(peak, 1e-9))
+        self._emit_level(db)
+        if self.state == "listening":
+            self._process_command_block(block, db, peak_db)
+
+    def _emit_level(self, db: float) -> None:
         linear_level = max(0.0, min(1.0, (db - self.LEVEL_MIN_DB) / abs(self.LEVEL_MIN_DB)))
         # Compress quiet speech upward so the HUD follows a normal microphone
         # voice visibly instead of looking flat until the user gets loud.
@@ -302,17 +353,24 @@ class MicrophoneService:
         if now - self._last_level_emit >= 0.05 or abs(level - self._last_level) >= 0.04:
             self._last_level_emit = now
             self._last_level = level
-            self._emit({"type": "mic_level", "level": round(level, 3), "db": round(db, 1)})
+            self._emit(
+                {
+                    "type": "mic_level",
+                    "level": round(level, 3),
+                    "db": round(db, 1),
+                    "noise_db": round(self._noise_db, 1),
+                    "gate_db": round(self._speech_start_db(), 1),
+                }
+            )
 
-    def _process_command_block(self, block: np.ndarray) -> None:
+    def _process_command_block(self, block: np.ndarray, db: float, peak_db: float) -> None:
         now = time.monotonic()
-        samples = block.astype(np.float32) / 32768.0
-        rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
-        db = 20.0 * math.log10(max(rms, 1e-9))
-        peak = float(np.max(np.abs(samples))) if samples.size else 0.0
-        peak_db = 20.0 * math.log10(max(peak, 1e-9))
-        speech_now = db >= self.SPEECH_START_DB or peak_db >= self.SPEECH_START_PEAK_DB
-        speech_continue = db >= self.SPEECH_CONTINUE_DB or peak_db >= self.SPEECH_CONTINUE_PEAK_DB
+        speech_now = db >= self._speech_start_db() or peak_db >= self._speech_start_peak_db()
+        speech_continue = (
+            db >= self._speech_continue_db() or peak_db >= self._speech_continue_peak_db()
+        )
+        if not speech_now:
+            self._update_noise_floor(db, peak_db)
 
         if self._command is None:
             self._pre_roll.append(block)
@@ -400,6 +458,7 @@ class MicrophoneService:
             )
         )
         result["stt_elapsed_ms"] = round((time.monotonic() - started_at) * 1000)
+        result["audio_seconds"] = round(samples.size / float(self.TARGET_SAMPLE_RATE), 2)
         result["type"] = "command_result"
         self._emit(result)
 

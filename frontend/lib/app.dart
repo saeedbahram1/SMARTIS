@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:audioplayers/audioplayers.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'services/backend_socket.dart';
@@ -25,6 +26,9 @@ class _SmartisAppState extends State<SmartisApp> {
   // Structured technical logs (streamed from the backend) + typed-chat history.
   final List<SmartisLogEntry> techLogs = [];
   final List<SmartisChatMessage> chat = [];
+  // Stable identity per bubble so Telegram-style editing can replace a message
+  // in place instead of appending a duplicate.
+  int _chatIdSeq = 0;
   // Backend log entries are re-sent after every WebSocket reconnect; remember what was shown.
   final Set<String> _seenLogKeys = <String>{};
 
@@ -32,7 +36,11 @@ class _SmartisAppState extends State<SmartisApp> {
   Timer? dashboardTimer;
 
   SmartisVisualState visualState = SmartisVisualState.idle;
-  double audioLevel = 0;
+  // The orb level lives in a ValueNotifier, not in widget state: mic_level
+  // arrives ~20x/s and a root setState at that rate rebuilds the whole window
+  // (chat list, dashboard, clock) every frame, which is exactly the lag that
+  // made the orb trail behind the real microphone. Only SmartisOrb listens.
+  final ValueNotifier<double> orbLevel = ValueNotifier<double>(0);
   String status = 'در حال اتصال به Backend...';
   String transcript = 'فرمان بده...';
   String detectedLanguage = '';
@@ -52,10 +60,33 @@ class _SmartisAppState extends State<SmartisApp> {
   String? activeChatRequestId;
   int _chatGeneration = 0;
 
+  // Files pinned to the conversation via the "+" button. They stay pinned
+  // after Send (removed only with their X) so follow-up questions about the
+  // same file keep their content context on the backend.
+  final List<ChatAttachmentChip> chatAttachments = [];
+  bool attachmentsBusy = false;
+
+  // Live progress steps of the running turn, streamed by the backend as
+  // {"type":"step"} frames. Cleared when a new turn starts and rendered by the
+  // collapsible activity strip inside the chat panel.
+  final List<ChatStep> chatSteps = [];
+
   // Voice operations share the same stop button as typed chat. The generation
   // token lets a late STT/model response safely die after the user presses Stop.
   String? activeVoiceRequestId;
   int _voiceGeneration = 0;
+  // True for the whole TTS turn: synthesis + playback. The backend keeps the
+  // microphone paused during that window and emits mic_state events, which must
+  // never drag the orb back to listening/thinking while audio is on its way out.
+  bool speakingActive = false;
+  // Bumped on every _speak() and on Stop. A stopped turn can stay parked on its
+  // 90 s completion timeout, and without this token its position listener would
+  // keep driving the orb level during the NEXT answer.
+  int _speechTurn = 0;
+  // Chat-side voice controls. micMuted must survive every automatic resume
+  // (after a command, a Stop, a reply) - those all go through _resumeMic().
+  bool micMuted = false;
+  bool voiceMuted = false;
 
   @override
   void initState() {
@@ -79,13 +110,18 @@ class _SmartisAppState extends State<SmartisApp> {
         setState(() {
           backendConnected = true;
           mode = internet ? 'ONLINE TTS' : 'OFFLINE';
-          status = ready ? 'گوش می‌دهم...' : 'میکروفون آماده نیست';
-          visualState = ready ? SmartisVisualState.listening : SmartisVisualState.idle;
+          status = micMuted ? 'میکروفون قطع است' : (ready ? 'گوش می‌دهم...' : 'میکروفون آماده نیست');
+          visualState = (ready && !micMuted) ? SmartisVisualState.listening : SmartisVisualState.idle;
           transcript = ready ? 'فرمان بده...' : 'میکروفون را بررسی کن';
         });
+        if (ready && micMuted) backend.pauseListening();
         _log('Backend ready • mic=$ready • device=${mic['device'] ?? 'unknown'}');
         break;
       case 'mic_ready':
+        if (micMuted) {
+          backend.pauseListening();
+          break;
+        }
         setState(() { visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; transcript = 'فرمان بده...'; });
         break;
       case 'mic_error':
@@ -94,8 +130,23 @@ class _SmartisAppState extends State<SmartisApp> {
         break;
       case 'mic_state':
         final state = message['state']?.toString() ?? '';
-        if (state == 'listening' && !processing) {
+        if (state == 'listening' && !processing && !speakingActive) {
+          if (micMuted) {
+            // Something re-enabled the mic server-side (e.g. speak_stop);
+            // the user's mute is authoritative, so suppress it again.
+            backend.pauseListening();
+            break;
+          }
           setState(() { visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; });
+        } else if (state == 'paused') {
+          // _finish_command() pauses the microphone at the exact moment STT
+          // starts decoding, so this is the first honest signal that the user
+          // has stopped talking. Show "thinking" here instead of waiting for
+          // the (much later) command_result. The TTS hold pauses the mic too,
+          // so it must not be mistaken for the start of a new turn.
+          if (!processing && !speakingActive && !micMuted && visualState == SmartisVisualState.listening) {
+            setState(() { visualState = SmartisVisualState.thinking; status = 'در حال پردازش...'; });
+          }
         } else if (state == 'stopped') {
           setState(() { visualState = SmartisVisualState.idle; status = 'میکروفون متوقف است'; });
         }
@@ -103,16 +154,31 @@ class _SmartisAppState extends State<SmartisApp> {
       case 'mic_level':
         final raw = message['level'];
         final level = raw is num ? raw.toDouble().clamp(0.0, 1.0).toDouble() : 0.0;
-        if (mounted) setState(() => audioLevel = level);
+        // Deliberately NOT setState: the orb is the only consumer.
+        orbLevel.value = level;
         break;
       case 'command_result': unawaited(_onCommand(message)); break;
       case 'mic_restarted':
         final mic = Map<String, dynamic>.from(message['microphone'] as Map? ?? const {});
         final ready = mic['running'] == true;
-        setState(() { processing = false; visualState = ready ? SmartisVisualState.listening : SmartisVisualState.idle; status = ready ? 'گوش می‌دهم...' : 'میکروفون آماده نیست'; });
+        setState(() { processing = false; visualState = (ready && !micMuted) ? SmartisVisualState.listening : SmartisVisualState.idle; status = micMuted ? 'میکروفون قطع است' : (ready ? 'گوش می‌دهم...' : 'میکروفون آماده نیست'); });
+        if (ready && micMuted) backend.pauseListening();
         break;
       case 'log':
         _pushTechLog(message);
+        break;
+      case 'step':
+        // Only collect steps while a turn is actually running: a late frame
+        // after Stop must not pop the strip back onto a finished conversation.
+        if (chatBusy || processing) {
+          final text = (message['text'] ?? '').toString().trim();
+          if (text.isNotEmpty) {
+            setState(() => chatSteps.add(ChatStep(
+                  text: text,
+                  icon: (message['icon'] ?? 'brain').toString(),
+                )));
+          }
+        }
         break;
       case 'chat':
         final plan = Map<String, dynamic>.from(message['plan'] as Map? ?? const {});
@@ -168,15 +234,112 @@ class _SmartisAppState extends State<SmartisApp> {
   void _pushChat(String text, {required bool fromUser, String? provider, bool confirm = false}) {
     if (!mounted) return;
     setState(() {
-      chat.add(SmartisChatMessage(text: text, fromUser: fromUser, time: _stamp(), provider: provider, confirm: confirm));
+      chat.add(SmartisChatMessage(
+        id: 'm${_chatIdSeq++}',
+        text: text,
+        fromUser: fromUser,
+        time: _stamp(),
+        provider: provider,
+        confirm: confirm,
+      ));
       if (chat.length > 300) chat.removeRange(0, chat.length - 300);
     });
+  }
+
+  /// Telegram-style edit: the bubble with [id] is REPLACED in place (no
+  /// duplicate), and because the user asked the edited command to actually run
+  /// again, the new text is immediately re-sent to the backend. The resend is
+  /// flagged so it does NOT append a second copy of the bubble.
+  void _editChatMessage(String id, String text) {
+    if (!mounted) return;
+    final value = text.trim();
+    if (value.isEmpty) return;
+    final index = chat.indexWhere((m) => m.id == id);
+    if (index < 0) {
+      _log('Edit ignored: message $id is no longer in the list', category: 'CHAT');
+      return;
+    }
+    final previous = chat[index];
+    if (previous.text == value) return;
+    setState(() {
+      chat[index] = previous.copyWith(text: value, edited: true);
+    });
+    _log('Message edited in place: «${previous.text}» -> «$value»', category: 'CHAT');
+    // Only user messages are commands/questions worth re-running; re-running an
+    // assistant bubble would just ask the model to answer itself.
+    if (previous.fromUser) {
+      unawaited(_sendChat(value, resend: true));
+    }
   }
 
   Future<void> _copyChatMessage(String text) async {
     if (text.trim().isEmpty) return;
     await Clipboard.setData(ClipboardData(text: text));
     _log('Chat message copied', category: 'CHAT');
+  }
+
+  /// The "+" button: pick one or more files (a ZIP included) and upload them to
+  /// the backend attachment store. Each successful upload becomes a pinned chip.
+  Future<void> _pickAttachments() async {
+    if (attachmentsBusy) return;
+    List<PlatformFile> picked;
+    try {
+      picked = await FilePicker.pickFiles(dialogTitle: 'افزودن فایل یا زیپ به گفتگو');
+    } catch (e) {
+      _log('File picker • $e', category: 'CHAT');
+      return;
+    }
+    if (picked.isEmpty) return;
+    final paths = picked
+        .map((f) => f.path)
+        .whereType<String>()
+        .where((p) => p.trim().isNotEmpty)
+        .toList();
+    if (paths.isEmpty) {
+      _log('File picker returned no usable path', category: 'CHAT');
+      return;
+    }
+    final room = 4 - chatAttachments.length;
+    if (room <= 0) {
+      _log('حداکثر ۴ فایل همزمان؛ برای افزودن فایل تازه یکی را حذف کن.', category: 'CHAT');
+      return;
+    }
+    final selected = paths.take(room).toList();
+    if (selected.length < paths.length) {
+      _log('فقط ۴ فایل همزمان پشتیبانی می‌شود؛ بقیه نادیده گرفته شد.', category: 'CHAT');
+    }
+    setState(() => attachmentsBusy = true);
+    try {
+      final result = await backend.uploadFiles(selected);
+      final incoming = <ChatAttachmentChip>[];
+      for (final raw in (result['attachments'] as List? ?? const [])) {
+        final item = Map<String, dynamic>.from(raw as Map);
+        if (item['ok'] == true) {
+          incoming.add(ChatAttachmentChip(
+            id: (item['id'] ?? '').toString(),
+            name: (item['name'] ?? 'file').toString(),
+            kind: (item['kind'] ?? 'other').toString(),
+            sizeLabel: (item['size_label'] ?? '').toString(),
+          ));
+        } else {
+          _log('آپلود ناموفق: ${item['name']} • ${item['error']}', category: 'CHAT');
+        }
+      }
+      if (!mounted) return;
+      if (incoming.isNotEmpty) {
+        setState(() => chatAttachments.addAll(incoming));
+        _log('Attachment ready: ${incoming.map((a) => a.name).join(', ')}', category: 'CHAT');
+      }
+    } catch (e) {
+      _log('Attachment upload • $e', category: 'CHAT');
+    } finally {
+      if (mounted) setState(() => attachmentsBusy = false);
+    }
+  }
+
+  void _removeAttachment(String id) {
+    setState(() => chatAttachments.removeWhere((a) => a.id == id));
+    _log('Attachment unpinned: $id', category: 'CHAT');
   }
 
   Future<void> _refreshDashboard() async {
@@ -214,7 +377,8 @@ class _SmartisAppState extends State<SmartisApp> {
     try {
       if (result['ok'] != true) {
         if (generation != _voiceGeneration) return;
-        setState(() { processing = false; status = 'خطا در تشخیص گفتار'; audioLevel = 0; });
+        setState(() { processing = false; status = 'خطا در تشخیص گفتار'; });
+        orbLevel.value = 0;
         _log('STT failed • ${result['error'] ?? 'unknown'}', category: 'STT');
         return;
       }
@@ -227,11 +391,19 @@ class _SmartisAppState extends State<SmartisApp> {
       final text = (result['text'] ?? '').toString().trim();
       final language = (result['language'] ?? '').toString().trim();
       if (generation != _voiceGeneration) return;
-      setState(() { transcript = text.isEmpty ? 'صدایی تشخیص داده نشد' : text; detectedLanguage = language; mode = result['offline'] == true ? 'OFFLINE STT' : 'ONLINE'; visualState = SmartisVisualState.thinking; status = text.isEmpty ? 'صدایی تشخیص داده نشد' : 'در حال اجرا...'; audioLevel = 0; });
-      _log('Recognized audio text: «$text» • ${result['stt_elapsed_ms'] ?? '?'}ms', category: 'STT');
+      setState(() { transcript = text.isEmpty ? 'صدایی تشخیص داده نشد' : text; detectedLanguage = language; mode = result['offline'] == true ? 'OFFLINE STT' : 'ONLINE'; visualState = SmartisVisualState.thinking; status = text.isEmpty ? 'صدایی تشخیص داده نشد' : 'در حال اجرا...'; });
+      orbLevel.value = 0;
+      _log(
+        'Recognized audio text: «$text» • capture=${result['audio_seconds'] ?? '?'}s • stt=${result['stt_elapsed_ms'] ?? '?'}ms',
+        category: 'STT',
+      );
       if (text.isNotEmpty) {
         _pushChat(text, fromUser: true);
-        setState(() => processing = true);
+        setState(() {
+          processing = true;
+          // New voice turn: the previous turn's steps are history.
+          chatSteps.clear();
+        });
         final requestId = 'v${DateTime.now().microsecondsSinceEpoch}_${generation}';
         activeVoiceRequestId = requestId;
         await _runAgent(text, language.isEmpty ? null : language, generation, requestId);
@@ -240,8 +412,12 @@ class _SmartisAppState extends State<SmartisApp> {
       if (!mounted || shuttingDown || generation != _voiceGeneration) return;
       activeVoiceRequestId = null;
       processing = false;
-      backend.resumeListening();
-      setState(() { visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; audioLevel = 0; });
+      _resumeMic();
+      setState(() {
+        visualState = micMuted ? SmartisVisualState.idle : SmartisVisualState.listening;
+        status = micMuted ? 'میکروفون قطع است' : 'گوش می‌دهم...';
+      });
+      orbLevel.value = 0;
     }
   }
 
@@ -319,16 +495,34 @@ class _SmartisAppState extends State<SmartisApp> {
   }
 
   /// Typed chat: commands are executed, everything else is answered by the
-  /// local model; the answer is shown as a bubble AND spoken.
-  Future<void> _sendChat(String text) async {
-    if (text.trim().isEmpty || chatBusy) return;
+  /// local model; the answer is shown as a bubble AND spoken. Pinned attachment
+  /// ids travel with every message so the model keeps the file content.
+  /// [resend] is true when the call comes from an in-place edit: the bubble
+  /// already shows the new text, so it must not be pushed a second time.
+  Future<void> _sendChat(String text, {bool resend = false}) async {
+    final value = text.trim();
+    final attachmentIds = chatAttachments.map((a) => a.id).toList();
+    if (chatBusy || attachmentsBusy) return;
+    if (value.isEmpty && attachmentIds.isEmpty) return;
     final requestId = '${DateTime.now().microsecondsSinceEpoch}_${_chatGeneration++}';
     activeChatRequestId = requestId;
     final generation = _chatGeneration;
-    _pushChat(text, fromUser: true);
-    setState(() { chatBusy = true; visualState = SmartisVisualState.thinking; status = chatThinking ? 'در حال فکر کردن عمیق...' : 'در حال فکر کردن...'; });
+    if (!resend) _pushChat(value.isEmpty ? 'این فایل را بررسی کن.' : value, fromUser: true);
+    setState(() {
+      chatBusy = true;
+      // New turn: drop the previous turn's steps so the strip starts clean.
+      chatSteps.clear();
+      visualState = SmartisVisualState.thinking;
+      status = chatThinking ? 'در حال فکر کردن عمیق...' : 'در حال فکر کردن...';
+    });
     try {
-      final response = await backend.chat(text, null, requestId, thinking: chatThinking);
+      final response = await backend.chat(
+        value,
+        null,
+        requestId,
+        thinking: chatThinking,
+        attachmentIds: attachmentIds,
+      );
       if (!mounted || generation != _chatGeneration || activeChatRequestId != requestId) return;
       _log('Route • ${response['mode'] ?? '-'} • ${response['provider'] ?? 'unknown'}', category: 'ROUTER');
       await _presentResponse(response, null);
@@ -338,16 +532,22 @@ class _SmartisAppState extends State<SmartisApp> {
     } finally {
       if (activeChatRequestId == requestId) activeChatRequestId = null;
       if (mounted && generation == _chatGeneration) {
-        setState(() { chatBusy = false; visualState = SmartisVisualState.listening; status = 'گوش می‌دهم...'; });
+        setState(() {
+          chatBusy = false;
+          visualState = micMuted ? SmartisVisualState.idle : SmartisVisualState.listening;
+          status = micMuted ? 'میکروفون قطع است' : 'گوش می‌دهم...';
+        });
       }
-      backend.resumeListening();
+      _resumeMic();
     }
   }
 
   Future<void> _stopChat() async {
     final requestId = activeChatRequestId;
     _chatGeneration++;
+    _speechTurn++;
     activeChatRequestId = null;
+    speakingActive = false;
     try { await player.stop(); } catch (_) {}
     if (requestId != null) {
       try { await backend.cancelChat(requestId); } catch (_) {}
@@ -356,19 +556,21 @@ class _SmartisAppState extends State<SmartisApp> {
     if (mounted) {
       setState(() {
         chatBusy = false;
-        visualState = SmartisVisualState.listening;
+        visualState = micMuted ? SmartisVisualState.idle : SmartisVisualState.listening;
         status = 'متوقف شد';
-        audioLevel = 0;
       });
+      orbLevel.value = 0;
       _log('Chat stopped by user.', category: 'CHAT');
     }
-    backend.resumeListening();
+    _resumeMic();
   }
 
   Future<void> _stopVoice() async {
     final requestId = activeVoiceRequestId;
     _voiceGeneration++;
+    _speechTurn++;
     activeVoiceRequestId = null;
+    speakingActive = false;
     processing = false;
     try { await player.stop(); } catch (_) {}
     if (requestId != null) {
@@ -379,13 +581,13 @@ class _SmartisAppState extends State<SmartisApp> {
     if (mounted) {
       setState(() {
         processing = false;
-        visualState = SmartisVisualState.listening;
+        visualState = micMuted ? SmartisVisualState.idle : SmartisVisualState.listening;
         status = 'متوقف شد';
-        audioLevel = 0;
       });
+      orbLevel.value = 0;
       _log('Voice operation stopped by user.', category: 'STT');
     }
-    backend.resumeListening();
+    _resumeMic();
   }
 
   Future<void> _stopCurrentOperation() async {
@@ -393,9 +595,58 @@ class _SmartisAppState extends State<SmartisApp> {
       await _stopChat();
       return;
     }
-    if (processing || visualState == SmartisVisualState.speaking) {
+    if (processing || speakingActive || visualState == SmartisVisualState.speaking) {
       await _stopVoice();
     }
+  }
+
+  /// Chat mic toggle (cut/connect). When muted, every automatic resume point
+  /// (_resumeMic) becomes a no-op and any server-side "listening" event is
+  /// re-suppressed, so the microphone stays really off until the user turns it
+  /// back on. The top-bar «بازنشانی میکروفون» button keeps its own behaviour.
+  void _toggleMic() {
+    final next = !micMuted;
+    if (next) {
+      backend.pauseListening();
+    } else {
+      backend.resumeListening();
+    }
+    setState(() {
+      micMuted = next;
+      visualState = next ? SmartisVisualState.idle : SmartisVisualState.listening;
+      status = next ? 'میکروفون قطع است' : 'گوش می‌دهم...';
+    });
+    _log(next ? 'Microphone muted (chat).' : 'Microphone re-enabled (chat).', category: 'STT');
+  }
+
+  /// Single gate every automatic mic-resume goes through, so a muted
+  /// microphone is never silently switched back on.
+  void _resumeMic() {
+    if (!micMuted) backend.resumeListening();
+  }
+
+  /// Chat voice toggle: cuts (or restores) Smartis's own spoken replies.
+  /// Cutting also stops whatever is being said right now and releases the
+  /// backend's echo-guard hold, then re-pauses the mic if it is muted.
+  void _toggleVoice() {
+    final next = !voiceMuted;
+    setState(() {
+      voiceMuted = next;
+      if (next && visualState == SmartisVisualState.speaking) {
+        visualState = micMuted ? SmartisVisualState.idle : SmartisVisualState.listening;
+        status = micMuted ? 'میکروفون قطع است' : 'گوش می‌دهم...';
+      }
+    });
+    if (next) {
+      _speechTurn++;
+      speakingActive = false;
+      orbLevel.value = 0;
+      unawaited(player.stop().catchError((_) {}));
+      unawaited(backend.stopSpeech().then((_) {
+        if (micMuted) backend.pauseListening();
+      }));
+    }
+    _log(next ? 'Smartis voice muted.' : 'Smartis voice enabled.', category: 'CHAT');
   }
 
   /// Plays TTS audio and keeps the microphone suppressed for the WHOLE audio.
@@ -432,16 +683,24 @@ class _SmartisAppState extends State<SmartisApp> {
     int? operationGeneration,
   }) async {
     if (!mounted || text.trim().isEmpty) return;
+    if (voiceMuted) return;
     if (operationGeneration != null && operationGeneration != _voiceGeneration) return;
-    setState(() {
-      visualState = SmartisVisualState.speaking;
-      status = 'دارم صحبت می‌کنم...';
-      audioLevel = .25;
-    });
+    final turn = ++_speechTurn;
+    speakingActive = true;
+    // edge-tts synthesises the WHOLE clip before it returns, so claiming
+    // "speaking" here would light the orb up seconds before any sound exists.
+    // Synthesis is a thinking phase; the orb only switches when audio starts.
+    if (mounted) {
+      setState(() {
+        if (visualState != SmartisVisualState.speaking) visualState = SmartisVisualState.thinking;
+        status = 'در حال آماده‌سازی پاسخ صوتی...';
+      });
+    }
 
     try {
       final result = await backend.speak(text, language);
-      if (!mounted || (operationGeneration != null && operationGeneration != _voiceGeneration)) return;
+      if (!mounted || turn != _speechTurn) return;
+      if (operationGeneration != null && operationGeneration != _voiceGeneration) return;
       final encoded = result['audio_base64']?.toString();
       if (encoded == null || encoded.isEmpty) return;
 
@@ -454,15 +713,21 @@ class _SmartisAppState extends State<SmartisApp> {
           duration = value;
         });
         positionSub = player.onPositionChanged.listen((position) {
-          if (!mounted || visualState != SmartisVisualState.speaking) return;
-          setState(() {
-            audioLevel = _speechVisualLevel(position, duration, text);
-          });
+          // A stopped-but-still-awaiting older turn must never drive the orb.
+          if (!mounted || turn != _speechTurn) return;
+          orbLevel.value = _speechVisualLevel(position, duration, text);
         });
 
         final completion = player.onPlayerComplete.first.timeout(
           const Duration(seconds: 90),
         );
+        if (mounted) {
+          setState(() {
+            visualState = SmartisVisualState.speaking;
+            status = 'دارم صحبت می‌کنم...';
+          });
+        }
+        orbLevel.value = .25;
         await player.play(
           BytesSource(
             base64Decode(encoded),
@@ -475,12 +740,12 @@ class _SmartisAppState extends State<SmartisApp> {
       } finally {
         await durationSub?.cancel();
         await positionSub?.cancel();
-        if (mounted && visualState == SmartisVisualState.speaking) {
-          setState(() => audioLevel = 0);
-        }
+        if (turn == _speechTurn) orbLevel.value = 0;
       }
     } catch (e) {
       _log('TTS playback • $e', category: 'SYSTEM');
+    } finally {
+      if (turn == _speechTurn) speakingActive = false;
     }
   }
 
@@ -502,6 +767,7 @@ class _SmartisAppState extends State<SmartisApp> {
     try { player.stop(); } catch (_) {}
     unawaited(backend.shutdownBackend());
     player.dispose();
+    orbLevel.dispose();
     backend.dispose();
     super.dispose();
   }
@@ -617,7 +883,10 @@ class _SmartisAppState extends State<SmartisApp> {
                     fit: BoxFit.contain,
                     child: Transform.scale(
                       scale: 1.28,
-                      child: SmartisOrb(state: visualState, level: audioLevel),
+                      child: ValueListenableBuilder<double>(
+                        valueListenable: orbLevel,
+                        builder: (context, level, _) => SmartisOrb(state: visualState, level: level),
+                      ),
                     ),
                   ),
                   const SizedBox(height: 28),
@@ -680,15 +949,24 @@ class _SmartisAppState extends State<SmartisApp> {
                 ? SmartisLogPanel(entries: techLogs, connected: backendConnected)
                 : SmartisChatPanel(
                     messages: chat,
-                    busy: chatBusy || processing || visualState == SmartisVisualState.speaking,
+                    busy: chatBusy || processing || speakingActive || visualState == SmartisVisualState.speaking,
                     thinking: chatThinking,
                     onThinkingChanged: (value) => setState(() => chatThinking = value),
                     onSend: _sendChat,
+                    onEditMessage: _editChatMessage,
                     onStop: _stopCurrentOperation,
-                    onMic: backend.restartMicrophone,
+                    micMuted: micMuted,
+                    onToggleMic: _toggleMic,
+                    voiceMuted: voiceMuted,
+                    onToggleVoice: _toggleVoice,
                     onCopyMessage: _copyChatMessage,
                     onConfirm: () => _sendChat('بله'),
                     onCancel: () => _sendChat('لغو'),
+                    attachments: chatAttachments,
+                    attachmentsBusy: attachmentsBusy,
+                    onPickFiles: _pickAttachments,
+                    onRemoveAttachment: _removeAttachment,
+                    steps: chatSteps,
                   ),
           ),
         ],

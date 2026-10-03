@@ -23,6 +23,11 @@ def tool_specs() -> list[dict[str, Any]]:
         {"name":"open_website","description":"Open a website in the default browser.","parameters":{"url":"string"}},
         {"name":"open_chrome_url","description":"Open a URL in Google Chrome whether Chrome is running or not.","parameters":{"url":"string"}},
         {"name":"open_wikipedia_page","description":"Open a Wikipedia article in Chrome.","parameters":{"query":"string","language":"string"}},
+        {"name":"create_project","description":"Create a folder, create a file inside it (optionally with an extension like py/txt) and optionally open it, as one dependent chain.","parameters":{"base":"string","folder":"string","file":"string","ext":"string","open_after":"boolean","language":"string"}},
+        {"name":"search_open_read","description":"Search Google for a topic, open the first result in Chrome and read its content aloud.","parameters":{"query":"string","language":"string"}},
+        {"name":"open_chatgpt_chat","description":"Open ChatGPT in Chrome with a new chat, then ask the user what to write.","parameters":{"language":"string"}},
+        {"name":"type_text","description":"Type text into the focused open ChatGPT window and send it; falls back to copying the text to the clipboard when no chat window is found.","parameters":{"text":"string","language":"string"}},
+        {"name":"write_code","description":"Write a program/script/game/website in the requested language from the user's description, save it as a project folder and optionally deliver it as a ZIP file.","parameters":{"spec":"string","base":"string","zip":"boolean","language":"string"}},
         {"name":"open_windows_settings","description":"Open Windows Settings.","parameters":{}},
         {"name":"windows_system_search","description":"Open Windows Search, optionally with a query.","parameters":{"query":"string"}},
         {"name":"close_application","description":"Close a running application by process/app name. Requires confirmation.","parameters":{"process":"string"}},
@@ -169,6 +174,21 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:return {"ok":False,"error":str(exc)}
     if name=="open_chrome_url": return _open_in_chrome(str(args.get("url","")))
     if name=="open_wikipedia_page": return _open_wikipedia(str(args.get("query","")),args.get("language"))
+    if name=="create_project":
+        from agent import system_tools
+        return system_tools.create_project(str(args.get("base") or "desktop"),str(args.get("folder","")),str(args.get("file","")),str(args.get("ext","")),str(args.get("content","")),bool(args.get("open_after",False)),args.get("language"))
+    if name=="search_open_read":
+        from services.research_service import search_open_read
+        return search_open_read(str(args.get("query","")),args.get("language"))
+    if name=="open_chatgpt_chat":
+        from agent import system_tools
+        return system_tools.open_chatgpt_chat(args.get("language"))
+    if name=="type_text":
+        from agent import system_tools
+        return system_tools.type_text(str(args.get("text","")),args.get("language"))
+    if name=="write_code":
+        from agent import system_tools
+        return system_tools.write_code_project(str(args.get("spec","")),str(args.get("base") or "desktop"),bool(args.get("zip",False)),bool(args.get("open_after",True)),args.get("language"))
     if name=="close_application": return _close_application(str(args.get("process") or args.get("app") or ""))
     if name=="open_windows_settings": return _open_settings()
     if name=="windows_system_search": return _windows_search(args.get("query"))

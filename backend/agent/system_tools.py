@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import ast
+import json
 import math
 import operator
 import os
 import re
 import shutil
 import subprocess
+import time
+import zipfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -19,6 +22,9 @@ _LOCATION_WEATHER = LocationWeatherService()
 _PENDING_WIKIPEDIA: dict[str, Any] | None = None
 _PENDING_FOLDER: dict[str, Any] | None = None
 _PENDING_FILE: dict[str, Any] | None = None
+_PENDING_PROMPT: dict[str, Any] | None = None
+_PENDING_PROMPT_AT: float = 0.0
+_PENDING_PROMPT_TTL: float = 180.0
 
 
 def _fa(language: str | None) -> bool:
@@ -120,6 +126,391 @@ def create_file(path: str, content: str = "", open_after: bool = False) -> dict[
         return {"ok": False, "error": str(exc)}
 
 
+_EXT_WORDS: dict[str, str] = {
+    "پایتونی": "py", "پایتون": "py", "python": "py", "پای": "py",
+    "متنی": "txt", "متن": "txt", "text": "txt", "txt": "txt",
+    "جاوااسکریپت": "js", "جاواسکریپت": "js", "javascript": "js", "js": "js",
+    "ورد": "docx", "word": "docx", "docx": "docx",
+    "اکسل": "xlsx", "excel": "xlsx", "xlsx": "xlsx",
+    "پی دی اف": "pdf", "pdf": "pdf",
+    "سی اس اس": "css", "css": "css",
+    "اچ تی ام ال": "html", "html": "html",
+    "جیسون": "json", "json": "json",
+    "مارک داون": "md", "markdown": "md", "md": "md",
+    "بچ": "bat", "bat": "bat", "کامند": "cmd", "cmd": "cmd",
+    "سی شارپ": "cs", "csharp": "cs", "c#": "cs",
+    "سی پلاس پلاس": "cpp", "cpp": "cpp",
+    "جاوا": "java", "java": "java",
+}
+
+
+def resolve_extension(word: str) -> str:
+    """«پایتونی» -> «py», «پی دی اف» -> «pdf», «py» -> «py»."""
+    value = re.sub(r"\s+", " ", str(word or "")).strip().strip(".،,؛;:").lower()
+    if not value:
+        return ""
+    if value in _EXT_WORDS:
+        return _EXT_WORDS[value]
+    # An already-latin extension can be used verbatim (max 8 chars, letters/digits).
+    if re.fullmatch(r"[a-z0-9]{1,8}", value):
+        return value
+    return ""
+
+
+def create_project(base: str, folder: str = "", file: str = "", ext: str = "", content: str = "", open_after: bool = False, language: str | None = None) -> dict[str, Any]:
+    """Composite of the user's sentence: make a folder, a file inside it, open the file.
+
+    Steps are executed here (not by the executor) because later steps depend on
+    earlier results (the file lives inside the folder), which the static planner
+    cannot express. Existing folder/file are reused instead of being an error.
+    """
+    fa = _fa(language)
+    base_path = resolve_user_path(base or "desktop")
+    folder_name = str(folder or "").strip().strip('"\'')
+    file_name = str(file or "").strip().strip('"\'')
+    ext_clean = re.sub(r"[^a-zA-Z0-9]", "", str(ext or "").replace(".", ""))
+    if not folder_name:
+        return {"ok": False, "error": "نام پوشه مشخص نیست." if fa else "The folder name is missing."}
+    folder_path = base_path / folder_name
+    try:
+        folder_created = False
+        if folder_path.exists():
+            if not folder_path.is_dir():
+                return {"ok": False, "error": f"یک فایل هم‌نام با پوشه وجود دارد: {folder_path}" if fa else f"A file already exists with the folder name: {folder_path}"}
+        else:
+            folder_path.mkdir(parents=True, exist_ok=False)
+            folder_created = True
+        file_path: Path | None = None
+        file_created = False
+        if file_name:
+            if ext_clean and "." not in file_name:
+                file_name = f"{file_name}.{ext_clean}"
+            file_path = folder_path / file_name
+            if not file_path.exists():
+                file_path.write_text(content or ("# Created by Smartis" if ext_clean == "py" else ""), encoding="utf-8")
+                file_created = True
+        opened = False
+        if open_after and file_path and file_path.exists():
+            try:
+                os.startfile(str(file_path))
+                opened = True
+            except Exception:
+                opened = False
+        parts_fa = []
+        parts_fa.append(f"پوشه «{folder_name}» {'ساخته شد' if folder_created else 'از قبل بود'}")
+        if file_name:
+            parts_fa.append(f"فایل «{file_name}» {'ساخته شد' if file_created else 'از قبل بود'}")
+        if open_after and opened:
+            parts_fa.append("و بازش کردم")
+        speak_fa = "، ".join(parts_fa) + "."
+        talk_en = []
+        talk_en.append(f"Folder '{folder_name}' {'created' if folder_created else 'already existed'}")
+        if file_name:
+            talk_en.append(f"file '{file_name}' {'created' if file_created else 'already existed'}")
+        if open_after and opened:
+            talk_en.append("opened")
+        return {
+            "ok": True,
+            "message": " ".join(talk_en) + ".",
+            "speak": speak_fa if fa else " ".join(talk_en) + ".",
+            "folder_path": str(folder_path),
+            "file_path": str(file_path) if file_path else None,
+            "folder_created": folder_created,
+            "file_created": file_created,
+            "opened": opened,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# Code writing and ZIP delivery ---------------------------------------------
+
+_CODE_SYSTEM_FA = """تو یک برنامه‌نویس حرفه‌ای هستی که برای دستیار Smartis کد می‌نویسد.
+فقط و فقط یک شیء JSON برگردان با این ساختار:
+{"name": "project_folder_name_in_snake_case", "files": [{"path": "main.py", "content": "کد کامل"}], "note": "یک جملهٔ فارسی کوتاه دربارهٔ کاری که کد انجام می‌دهد"}
+قواعد:
+- کد کامل، قابل اجرا و بدون جای خالی (بدون TODO و ...) بنویس؛ درخواست کاربر را دقیق پیاده کن.
+- حداقل یک فایل و حداکثر ۴ فایل. فایل اصلی را main با پسوند زبان درخواستی بگذار.
+- کد و نام فایل‌ها انگلیسی؛ فقط مقدار note فارسی باشد.
+- هیچ متن اضافه‌ای بیرون از JSON ننویس."""
+
+_CODE_SYSTEM_EN = """You are a professional programmer writing code for the Smartis assistant.
+Return ONLY one JSON object:
+{"name": "project_folder_name_in_snake_case", "files": [{"path": "main.py", "content": "full code"}], "note": "one short sentence about what the code does"}
+Rules:
+- Complete, runnable code. No TODOs or placeholders; implement exactly what the user asked.
+- At least one file, at most 4. Name the main file main with the requested language extension.
+- Keep explanations inside the JSON only."""
+
+
+def _generate_code_project(spec: str, language: str | None = None) -> dict[str, Any] | None:
+    """Ask the local model for the project files. Separated so tests can stub it."""
+    from agent.llm import generate
+    from agent.ollama_model import resolve_model
+    from config import CODE_MAX_TOKENS, CODE_TIMEOUT
+
+    result = generate(
+        resolve_model(),
+        [
+            {"role": "system", "content": _CODE_SYSTEM_FA if _fa(language) else _CODE_SYSTEM_EN},
+            {"role": "user", "content": str(spec or "").strip()},
+        ],
+        num_predict=CODE_MAX_TOKENS,
+        temperature=0.25,
+        json_mode=True,
+        total_timeout=CODE_TIMEOUT,
+        label="codegen",
+    )
+    if not result.ok:
+        return None
+    try:
+        data = json.loads(result.text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _safe_file_name(name: str) -> str:
+    """Keep only the basename so a generated path can never escape the folder."""
+    base = Path(str(name or "").replace("\\", "/")).name
+    base = re.sub(r"[^A-Za-z0-9_.\-]", "_", base).strip("._")
+    return base[:80]
+
+
+def _safe_folder_name(name: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_\-]", "_", str(name or "").strip()).strip("_")
+    return value[:60] or "smartis_project"
+
+
+def _strip_stray_braces(content: str) -> str:
+    """Drop trailing '}' the model sometimes appends inside the JSON string.
+
+    In json_mode a small model occasionally closes its answer with an extra
+    brace that lands inside the file content (main()\\n}); unbalanced trailing
+    closing braces are that artifact, balanced ones (dict/JS literals) stay.
+    """
+    text = content.rstrip()
+    while text.endswith("}") and text.count("}") > text.count("{"):
+        text = text[:-1].rstrip()
+    return text
+
+
+def write_code_project(spec: str, base: str = "desktop", want_zip: bool = False, open_after: bool = True, language: str | None = None) -> dict[str, Any]:
+    """Write the requested code as a project folder and deliver it (optionally as ZIP).
+
+    The model answers with JSON {name, files[], note}; file paths are reduced to
+    safe basenames and a fresh folder name is picked when one already exists so
+    an existing project of the user is never overwritten.
+    """
+    fa = _fa(language)
+    from agent.logbus import logbus
+
+    logbus.emit("CODEGEN", f"Generating code ({'zip' if want_zip else 'folder'}):", str(spec or "")[:200])
+    data = _generate_code_project(spec, language)
+    if not data:
+        return {"ok": False, "error": "تولید کد ناموفق بود؛ دوباره امتحان کن." if fa else "Code generation failed; please try again."}
+
+    files: dict[str, str] = {}
+    for item in (data.get("files") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        clean = _safe_file_name(item.get("path") or item.get("name") or "")
+        content = _strip_stray_braces(str(item.get("content") or ""))
+        if clean and content and len(content) <= 200_000:
+            files[clean] = content
+    if not files:
+        return {"ok": False, "error": "مدل کد معتبری برنگرداند؛ دوباره امتحان کن." if fa else "The model returned no usable files; please try again."}
+
+    base_path = resolve_user_path(base or "desktop")
+    folder_root = _safe_folder_name(data.get("name"))
+    folder_path = base_path / folder_root
+    counter = 2
+    while folder_path.exists():
+        folder_path = base_path / f"{folder_root}_{counter}"
+        counter += 1
+    try:
+        folder_path.mkdir(parents=True, exist_ok=False)
+        for fname, content in files.items():
+            (folder_path / fname).write_text(content, encoding="utf-8")
+        zip_path: Path | None = None
+        if want_zip:
+            zip_path = base_path / f"{folder_path.name}.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fname in files:
+                    zf.write(folder_path / fname, arcname=f"{folder_path.name}/{fname}")
+        opened = False
+        if open_after:
+            try:
+                if zip_path is not None:
+                    subprocess.Popen(f'explorer /select,"{zip_path}"')
+                else:
+                    os.startfile(str(folder_path))
+                opened = True
+            except Exception:
+                opened = False
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    count = len(files)
+    note = str(data.get("note") or "").strip()
+    if fa:
+        speak = f"کد را نوشتم؛ {count} فایل در پوشهٔ «{folder_path.name}» ساخته شد."
+        if zip_path is not None:
+            speak += f" فایل زیپ «{zip_path.name}» هم کنار آن تحویل داده شد."
+    else:
+        speak = f"Done; {count} files were written to the folder '{folder_path.name}'."
+        if zip_path is not None:
+            speak += f" The ZIP file '{zip_path.name}' was delivered next to it."
+    logbus.emit("CODEGEN", f"Wrote {count} files to {folder_path}" + (f" + {zip_path.name}" if zip_path else ""), note)
+    return {
+        "ok": True,
+        "message": f"Wrote {count} files to {folder_path}" + (f" and packed {zip_path}" if zip_path else ""),
+        "speak": speak,
+        "note": note,
+        "folder_path": str(folder_path),
+        "zip_path": str(zip_path) if zip_path else None,
+        "files": sorted(files.keys()),
+        "opened": opened,
+    }
+
+
+# Chat-window typing --------------------------------------------------------
+
+_CHAT_WINDOW_HINTS = ("chatgpt", "chat gpt", "chat\u200cجی\u200cپی\u200cتی", "چت جی پی تی", "openai")
+
+
+def _chat_window_hint() -> int | None:
+    """Find a visible ChatGPT-like top-level window and return its hwnd."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = (buf.value or "").lower()
+                if any(hint in title for hint in _CHAT_WINDOW_HINTS):
+                    found.append(int(hwnd))
+                    return False
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        return found[0] if found else None
+    except Exception:
+        return None
+
+
+def _focus_window(hwnd: int) -> bool:
+    """Best-effort foreground switch; returns True only when it actually worked."""
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        try:
+            fg = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg, None)
+            my_thread = kernel32.GetCurrentThreadId()
+            if fg_thread != my_thread:
+                user32.AttachThreadInput(my_thread, fg_thread, True)
+                user32.SetForegroundWindow(hwnd)
+                user32.AttachThreadInput(my_thread, fg_thread, False)
+            else:
+                user32.SetForegroundWindow(hwnd)
+        except Exception:
+            try:
+                user32.SetForegroundWindow(hwnd)
+            except Exception:
+                return False
+        time.sleep(0.15)
+        return int(user32.GetForegroundWindow() or 0) == int(hwnd)
+    except Exception:
+        return False
+
+
+def _paste_clipboard() -> bool:
+    """Ctrl+V then Enter via keybd_event, sent only when the target is focused."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        VK_CONTROL, VK_V, VK_RETURN, KEYUP = 0x11, 0x56, 0x0D, 0x0002
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
+        time.sleep(0.25)
+        user32.keybd_event(VK_RETURN, 0, 0, 0)
+        user32.keybd_event(VK_RETURN, 0, KEYUP, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _set_clipboard(text: str) -> bool:
+    try:
+        script = "$q=[Console]::In.ReadToEnd(); Set-Clipboard -Value $q"
+        proc = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], input=text.encode("utf-8"), capture_output=True, timeout=8)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def type_text(text: str, language: str | None = None) -> dict[str, Any]:
+    """Paste text into the focused chat window, or hand it to the clipboard.
+
+    Keystrokes are only sent after verifying the ChatGPT window really is the
+    foreground window; otherwise the text stays on the clipboard so it can
+    never leak into an unrelated app the user is using.
+    """
+    fa = _fa(language)
+    body = str(text or "").strip()
+    if not body:
+        return {"ok": False, "error": "متنی برای نوشتن مشخص نیست." if fa else "There is no text to type."}
+    copied = _set_clipboard(body)
+    if not copied:
+        return {"ok": False, "error": "نتونستم متن را در کلیپ‌بورد بذارم." if fa else "I couldn't put the text on the clipboard."}
+    hwnd = _chat_window_hint()
+    if hwnd and _focus_window(hwnd):
+        _paste_clipboard()
+        speak = "نوشتم و فرستادم." if fa else "Typed and sent."
+        return {"ok": True, "method": "paste", "speak": speak}
+    speak = ("متن را کپی کردم؛ پنجرهٔ چت را باز کن و Ctrl+V و اینتر بزن." if fa else "I copied the text; open the chat window and press Ctrl+V then Enter.")
+    return {"ok": True, "method": "clipboard", "speak": speak}
+
+
+def open_chatgpt_chat(language: str | None = None) -> dict[str, Any]:
+    """Open a fresh ChatGPT chat tab and ask what to write."""
+    fa = _fa(language)
+    try:
+        from agent.tools import _open_in_chrome
+
+        result = _open_in_chrome("https://chatgpt.com/?new")
+        if not (result or {}).get("ok"):
+            return {"ok": False, "error": f"نتونستم چت جی پی تی را باز کنم: {(result or {}).get('error', '')}" if fa else f"I couldn't open ChatGPT: {(result or {}).get('error', '')}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    set_pending_prompt("chatgpt")
+    speak = "چت جی پی تی را باز کردم. چی بنویسم براش؟" if fa else "ChatGPT is open. What should I write for it?"
+    return {"ok": True, "message": speak, "speak": speak, "await_prompt": True}
+
+
 def delete_file(path: str) -> dict[str, Any]:
     target = resolve_user_path(path)
     try:
@@ -172,6 +563,70 @@ def take_pending_file() -> dict[str, Any] | None:
 
 def has_pending_file() -> bool:
     return _PENDING_FILE is not None
+
+
+def set_pending_prompt(kind: str = "chatgpt") -> None:
+    """Queue the «چی بنویسم براش؟» question when Smartis opens a chat box.
+
+    The very next utterance is treated as message text (typed into the open
+    window) instead of being routed as a normal command. A TTL keeps a stale
+    prompt from swallowing an unrelated later request.
+    """
+    global _PENDING_PROMPT, _PENDING_PROMPT_AT
+    _PENDING_PROMPT = {"kind": str(kind or "chatgpt")}
+    _PENDING_PROMPT_AT = time.monotonic()
+
+
+def take_pending_prompt() -> dict[str, Any] | None:
+    global _PENDING_PROMPT, _PENDING_PROMPT_AT
+    if not has_pending_prompt():
+        return None
+    value = dict(_PENDING_PROMPT or {})
+    _PENDING_PROMPT = None
+    _PENDING_PROMPT_AT = 0.0
+    return value
+
+
+def has_pending_prompt() -> bool:
+    if not _PENDING_PROMPT:
+        return False
+    if (time.monotonic() - _PENDING_PROMPT_AT) > _PENDING_PROMPT_TTL:
+        # Expired: a much later sentence must not be swallowed as chat text.
+        take_pending_prompt()
+        return False
+    return True
+
+
+def clear_all_pendings() -> bool:
+    """Drop every queued follow-up (reading, file name, folder name, prompt) at once.
+
+    A plain «نه»/«لغو» must answer whatever Smartis is waiting for, so all
+    pending slots are cleared together. Returns True when something was waiting.
+    """
+    global _PENDING_WIKIPEDIA, _PENDING_FOLDER, _PENDING_FILE, _PENDING_PROMPT, _PENDING_PROMPT_AT
+    had = bool(_PENDING_WIKIPEDIA or _PENDING_FOLDER or _PENDING_FILE or has_pending_prompt())
+    _PENDING_WIKIPEDIA = None
+    _PENDING_FOLDER = None
+    _PENDING_FILE = None
+    _PENDING_PROMPT = None
+    _PENDING_PROMPT_AT = 0.0
+    return had
+
+
+def set_reading_pending(title: str, text: str, language: str | None = None, url: str | None = None) -> None:
+    """Queue raw source text so «ادامه بده» can keep reading after a research answer."""
+    global _PENDING_WIKIPEDIA
+    body = str(text or "").strip()
+    if not body:
+        return
+    _PENDING_WIKIPEDIA = {
+        "title": str(title or "").strip() or ("تحقیق" if language != "en" else "Research"),
+        "language": "fa" if _fa(language) else "en",
+        "text": body[:2600],
+        "full_text": body,
+        "url": url,
+        "offset": 0,
+    }
 
 
 def shutdown_windows() -> dict[str, Any]:

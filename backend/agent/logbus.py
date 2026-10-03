@@ -66,6 +66,34 @@ class LogBus:
                     pass
         return entry
 
+    def emit_step(self, text: str, icon: str = "brain", state: str = "running") -> dict[str, Any]:
+        """Ephemeral per-turn progress event for the chat "steps" strip.
+
+        Unlike log entries these are NOT stored: a step belongs to the live UI
+        turn only, so it is broadcast to current WebSocket subscribers and is
+        never replayed after a reconnect.
+        """
+        entry = {
+            "type": "step",
+            "text": str(text or ""),
+            "icon": str(icon or "brain"),
+            "state": str(state or "running"),
+            "time": time.strftime("%H:%M:%S"),
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            subscribers = tuple(self._subscribers)
+        for q in subscribers:
+            try:
+                q.put_nowait(entry)
+            except Exception:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(entry)
+                except Exception:
+                    pass
+        return entry
+
     def recent(self, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._entries)[-max(1, int(limit)):]

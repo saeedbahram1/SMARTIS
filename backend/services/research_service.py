@@ -14,7 +14,7 @@ from urllib.parse import quote_plus, urljoin
 
 import requests
 
-from config import OLLAMA_URL
+from agent.llm import generate as llm_generate
 from agent.ollama_model import ensure_ollama, resolve_model
 
 UA = "Smartis/23 (Windows voice assistant; research)"
@@ -163,14 +163,19 @@ Use only the supplied source material. Combine consistent facts, distinguish unc
     try:
         if not ensure_ollama().get("ok"):
             return None
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={"model": resolve_model(), "stream": False, "messages": [{"role": "user", "content": prompt}], "options": {"temperature": 0.15, "num_predict": 500}},
-            timeout=12,
+        # Route through the single LLM gateway so this request uses the SAME
+        # num_ctx / keep_alive / num_thread as chat. The old raw request omitted
+        # num_ctx, which made Ollama restart the runner between research and chat.
+        result = llm_generate(
+            resolve_model(),
+            [{"role": "user", "content": prompt}],
+            num_predict=500,
+            temperature=0.15,
+            total_timeout=12.0,
+            first_token_timeout=12.0,
+            label="research",
         )
-        r.raise_for_status()
-        text = str(r.json().get("message", {}).get("content", "")).strip()
-        return text or None
+        return result.text.strip() or None
     except Exception:
         return None
 
@@ -203,11 +208,95 @@ def research(query: str, language: str | None = None) -> dict[str, Any]:
         else:
             answer = sources[0].get("snippet") or sources[0].get("text", "")[:1800]
 
+    # Same follow-up as a plain Wikipedia answer: when the gathered source text is
+    # much longer than the summary, queue it so «ادامه بده» / "continue" keeps
+    # reading (fast_path turns that reply into wikipedia_more, never chat).
+    read_text = str((wiki or {}).get("text") or "").strip()
+    if not read_text:
+        read_text = " ".join(
+            str(s.get("text") or s.get("snippet") or "").strip()
+            for s in sources
+            if (s.get("text") or s.get("snippet"))
+        ).strip()
+    ask = ""
+    if len(read_text) > len(str(answer)) + 400:
+        try:
+            from agent import system_tools
+
+            system_tools.set_reading_pending(q, read_text, lang, sources[0].get("url") if sources else None)
+            ask = "می‌خوای کامل‌تر بخونم؟" if lang == "fa" else "Would you like me to read more?"
+        except Exception:
+            ask = ""
+
     return {
         "ok": True,
         "query": q,
         "answer": answer,
         "sources": [{"title": s.get("title", ""), "url": s.get("url", ""), "source": s.get("source", "Web")} for s in sources[:5]],
         "wikipedia_used": bool(wiki),
-        "speak": answer,
+        "speak": (str(answer).strip() + (" " + ask if ask else "")).strip(),
+    }
+
+
+def search_open_read(query: str, language: str | None = None) -> dict[str, Any]:
+    """«برو تو گوگل X رو جستجو کن، صفحهٔ اولش رو باز کن و بخون» as one command.
+
+    Opens the Google results page and the first real hit in Chrome, reads the
+    first page, and queues the text so «ادامه بده» keeps reading.
+    """
+    q = re.sub(r"\s+", " ", str(query or "")).strip()
+    lang = "en" if language == "en" else "fa"
+    if not q:
+        return {"ok": False, "error": "موضوع جست‌وجو مشخص نیست." if lang == "fa" else "The search topic is missing."}
+    try:
+        from agent.tools import _open_in_chrome
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    _open_in_chrome(f"https://www.google.com/search?q={quote_plus(q)}")
+    hits = _search(q)
+    first = hits[0] if hits else None
+    if first:
+        _open_in_chrome(first["url"])
+    else:
+        wiki_probe = _wikipedia(q, lang)
+        if wiki_probe:
+            first = wiki_probe
+            _open_in_chrome(wiki_probe["url"])
+
+    body = ""
+    title = q
+    url = (first or {}).get("url")
+    if first:
+        title = str(first.get("title") or q).strip() or q
+        body = _fetch(first.get("url", ""))
+    if not body:
+        wiki = _wikipedia(q, lang)
+        if wiki:
+            title, body, url = wiki["title"], wiki["text"], wiki["url"]
+    if not body:
+        snippet = str((first or {}).get("snippet") or "").strip()
+        if snippet:
+            body = snippet
+    if not body:
+        return {"ok": False, "error": f"صفحه‌ای دربارهٔ «{q}» باز شد ولی متنی برای خواندن نداشت." if lang == "fa" else f"I opened a page about {q} but there was no readable text."}
+
+    try:
+        from agent import system_tools
+
+        system_tools.set_reading_pending(title, body, lang, url)
+    except Exception:
+        pass
+    ask = "می‌خوای کامل‌تر بخونم؟" if lang == "fa" else "Would you like me to read more?"
+    short = body[:1500].strip()
+    prefix = f"«{title}» را باز کردم. " if lang == "fa" else f"I opened {title}. "
+    spoken = f"{prefix}{short} {ask}"
+    return {
+        "ok": True,
+        "query": q,
+        "title": title,
+        "url": url,
+        "message": short,
+        "speak": spoken,
+        "has_more": len(body) > 1500,
     }

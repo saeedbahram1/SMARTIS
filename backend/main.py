@@ -22,6 +22,7 @@ from agent.executor import execute_plan, execute_pending_confirmation, pending_c
 from agent.fast_path import fast_plan
 from agent.planner import fallback_plan, plan_with_ollama
 from agent.context_memory import memory
+from agent import attachments
 from agent import chat as chat_agent
 from agent import router
 from agent.echo_guard import guard as echo_guard
@@ -264,9 +265,17 @@ def process_command(text: str, language: str | None, request_id: str | None = No
     return router.handle_input(text, language, source="voice", request_id=request_id, thinking=thinking)
 
 
-def process_chat(text: str, language: str | None, request_id: str | None = None, thinking: bool = False) -> dict:
+def process_chat(
+    text: str,
+    language: str | None,
+    request_id: str | None = None,
+    thinking: bool = False,
+    extra_context: str = "",
+) -> dict:
     """Typed entry point. Commands are executed, everything else is answered by Ollama."""
-    return router.handle_input(text, language, source="text", request_id=request_id, thinking=thinking)
+    return router.handle_input(
+        text, language, source="text", request_id=request_id, thinking=thinking, extra_context=extra_context
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +586,36 @@ async def speak(payload: dict):
     return result
 
 
+@app.post("/chat/upload")
+async def chat_upload(
+    files: list[UploadFile] = File(...),
+    language: str | None = Form(default=None),
+):
+    """Chat attachments: store each uploaded file and return a descriptor.
+
+    The client sends attachment IDs (not paths) with the next /chat message;
+    the backend turns them into a content block the chat model can read.
+    """
+    stored = []
+    for upload in files:
+        try:
+            data = await upload.read()
+        except Exception as exc:  # noqa: BLE001 - a broken upload must not kill the batch
+            stored.append({"ok": False, "name": upload.filename or "?", "error": str(exc)})
+            continue
+        record = await asyncio.to_thread(attachments.store_upload, upload.filename or "file", data, language)
+        if record.get("ok"):
+            count = int(record.get("files") or 0)
+            suffix = f", {count} entries" if record.get("kind") == "zip" else ""
+            logbus.emit(
+                "CHAT",
+                f"Attachment received: {record.get('name')} ({record.get('size_label')}, {record.get('kind')}{suffix})",
+                _brief(str(record.get("name"))),
+            )
+        stored.append(record)
+    return _json_safe({"ok": True, "attachments": stored})
+
+
 @app.post("/command")
 async def command(payload: dict):
     text = str(payload.get("text", "")).strip()
@@ -594,9 +633,25 @@ async def chat_endpoint(payload: dict):
     language = payload.get("language")
     request_id = str(payload.get("request_id") or "").strip() or None
     thinking = bool(payload.get("thinking", False))
+    attachment_ids = [str(item) for item in (payload.get("attachments") or []) if str(item).strip()][:4]
+
+    extra_context = ""
+    if attachment_ids:
+        lang_hint = _effective_language(text, language) or "fa"
+        logbus.emit_step(
+            "بررسی فایل‌های ضمیمه…" if lang_hint != "en" else "Inspecting the attached files…", "attach"
+        )
+        extra_context = await asyncio.to_thread(attachments.context_for, attachment_ids, lang_hint, text)
+        if not text:
+            # «فایل رو بفرست» with no question: the user still wants it examined.
+            text = "این فایل را کامل بررسی کن و توضیح بده داخلش چیست." if lang_hint != "en" else "Inspect this file fully and explain what is inside."
     if not text:
         return {"ok": False, "error": "Text is empty."}
-    return _json_safe(await asyncio.to_thread(process_chat, text, language, request_id, thinking))
+    result = await asyncio.to_thread(process_chat, text, language, request_id, thinking, extra_context)
+    result = _json_safe(result)
+    if attachment_ids:
+        result["attachments_used"] = True
+    return result
 
 
 @app.post("/chat/cancel")
@@ -667,19 +722,34 @@ async def websocket_endpoint(websocket: WebSocket):
     )
 
     async def send_events() -> None:
-        while True:
-            try:
-                event = await asyncio.to_thread(events.get, True, 0.25)
-                await send_json_event(event)
-            except queue.Empty:
-                pass
-            try:
-                entry = await asyncio.to_thread(log_events.get, True, 0.25)
-                await send_json_event(entry)
-            except queue.Empty:
-                pass
+        """Pump both event queues CONCURRENTLY.
 
-    for entry in logbus.recent(400):
+        The previous version polled the microphone queue and then the log queue
+        in the same loop iteration, each with a 0.25 s blocking get. A mic_level
+        or mic_state event that arrived right after the mic poll therefore had
+        to wait for the log poll to time out: up to 0.5 s of pure transport lag
+        on top of the real audio pipeline. That lag is what made the Orb look
+        desynchronised from listening/processing/speaking. Each queue now has
+        its own task, so nothing can head-of-line block anything else.
+        """
+        async def _pump(source: "queue.Queue") -> None:
+            while True:
+                try:
+                    first = await asyncio.to_thread(source.get, True, 0.2)
+                except queue.Empty:
+                    continue
+                batch = [first]
+                while len(batch) < 32:
+                    try:
+                        batch.append(source.get_nowait())
+                    except queue.Empty:
+                        break
+                for payload in batch:
+                    await send_json_event(payload)
+
+        await asyncio.gather(_pump(events), _pump(log_events))
+
+    for entry in logbus.recent(200):
         await send_json_event(entry)
 
     async def receive_actions() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from agent.tools import execute_tool
 from config import CONFIRMATION_TTL_SECONDS, REQUIRE_CONFIRMATION_FOR
@@ -93,7 +93,11 @@ def execute_pending_confirmation() -> dict[str, Any]:
     return execute_plan(plan, True)
 
 
-def execute_plan(plan: dict[str, Any], confirmed: bool = False) -> dict[str, Any]:
+def execute_plan(
+    plan: dict[str, Any],
+    confirmed: bool = False,
+    on_action: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     global _PENDING_CONFIRMATION, _PENDING_AT
     actions = plan.get("actions", [])
     if not isinstance(actions, list):
@@ -113,6 +117,14 @@ def execute_plan(plan: dict[str, Any], confirmed: bool = False) -> dict[str, Any
                 _PENDING_CONFIRMATION = {**plan, "actions": [dict(item) for item in actions[index:]]}
                 _PENDING_AT = time.time()
             return {"ok": True, "needs_confirmation": True, "tool": tool, "args": args, "results": results}
+        if on_action is not None:
+            # Runs right before the tool starts so the chat strip names the
+            # action that is ACTUALLY in flight (sequential honesty). A broken
+            # reporter must never break execution.
+            try:
+                on_action(action)
+            except Exception:
+                pass
         result = execute_tool(tool, args)
         results.append({"tool": tool, "result": result})
         if not result.get("ok"):

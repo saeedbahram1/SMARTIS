@@ -21,8 +21,11 @@ def main() -> int:
         r.raise_for_status()
         models = [str(x.get("name")) for x in (r.json().get("models") or []) if isinstance(x, dict)]
         print(f"MODELS: {models}")
-        if OLLAMA_MODEL not in models:
+        # Ollama may report "qwen2.5:1.5b:latest"; that is the same model.
+        norm = lambda n: str(n or "").strip().lower().removesuffix(":latest")  # noqa: E731
+        if norm(OLLAMA_MODEL) not in {norm(m) for m in models}:
             print("RESULT: FAIL — configured model is not installed.")
+            print(f"FIX   : ollama pull {OLLAMA_MODEL}")
             return 2
 
         try:

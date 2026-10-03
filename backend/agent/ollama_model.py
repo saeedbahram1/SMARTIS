@@ -23,10 +23,13 @@ _PREFERRED = (
     "qwen3.5:2b",
     "qwen3:4b",
     "qwen3:1.7b",
+    "qwen2.5:1.5b",
 )
 _lock = threading.Lock()
 _cached_model: str | None = None
 _cached_at = 0.0
+# tag -> capabilities reported by /api/tags (e.g. {"completion", "tools"})
+_CAPABILITIES: dict[str, set[str]] = {}
 _ensure_lock = threading.Lock()
 _ensure_last = 0.0
 _ensure_ok = False
@@ -35,6 +38,10 @@ _OLLAMA_STARTED_BY_SMARTIS = False
 _OLLAMA_SERVER_PIDS: set[int] = set()
 _CACHE_SECONDS = 20.0
 _ENSURE_RETRY_SECONDS = 8.0
+
+
+def _norm_tag(name: str) -> str:
+    return str(name or "").strip().lower().removesuffix(":latest")
 
 
 def _names(timeout: float = 0.8) -> set[str]:
@@ -46,11 +53,31 @@ def _names(timeout: float = 0.8) -> set[str]:
         for item in data.get("models") or []:
             if isinstance(item, dict):
                 name = str(item.get("name") or "").strip()
-                if name:
-                    out.add(name)
+                if not name:
+                    continue
+                out.add(name)
+                caps = item.get("capabilities")
+                if isinstance(caps, list):
+                    _CAPABILITIES[_norm_tag(name)] = {str(c).strip().lower() for c in caps}
         return out
     except Exception:
         return set()
+
+
+def supports_thinking(model: str) -> bool:
+    """True only when Ollama advertises a `thinking` capability for this tag.
+
+    qwen2.5:1.5b reports ["completion", "tools"] and answers HTTP 400 to
+    think=true, so callers must not budget for a reasoning channel it never
+    produces. An Ollama too old to report capabilities is treated as supportive
+    and llm.generate's own 400 retry stays as the safety net.
+    """
+    if not _CAPABILITIES:
+        _names()
+    caps = _CAPABILITIES.get(_norm_tag(model))
+    if caps is None:
+        return True
+    return "thinking" in caps
 
 
 def _listening_pids(port: int = 11434) -> set[int]:
@@ -276,7 +303,7 @@ def model_status() -> dict[str, Any]:
     model = resolve_model()
     models = set(status.get("models") or [])
     loaded = loaded_models(timeout=1.2)
-    # "qwen3.5:4b" and "qwen3.5:4b:latest"-style differences must not make a
+    # "qwen2.5:1.5b" and "qwen2.5:1.5b:latest"-style differences must not make a
     # perfectly good model look missing/unloaded.
     norm = lambda n: str(n or "").strip().lower().removesuffix(":latest")  # noqa: E731
     models_n = {norm(m) for m in models}

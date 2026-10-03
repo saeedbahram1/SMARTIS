@@ -1,16 +1,21 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 
 enum SmartisVisualState { idle, listening, thinking, speaking }
 
 class SmartisOrb extends StatefulWidget {
   final SmartisVisualState state;
   final double level;
+  /// Rendered square size. 390 = the full orb; the chat activity strip embeds
+  /// a small copy (e.g. 34) and everything scales down proportionally.
+  final double size;
 
   const SmartisOrb({
     super.key,
     required this.state,
     this.level = 0,
+    this.size = 390,
   });
 
   @override
@@ -19,34 +24,41 @@ class SmartisOrb extends StatefulWidget {
 
 class _SmartisOrbState extends State<SmartisOrb>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
+  // Continuous wall-clock seconds. The old AnimationController repeated every
+  // 2600 ms, so its value wrapped 1 -> 0 and every angle derived from the phase
+  // jumped 2*pi -> 0: the whole HUD visibly snapped back to the start
+  // ("hy az aval miyad"). A raw Ticker never wraps, so phase grows smoothly
+  // and the motion keeps rotating forever. /2.6 in the painter preserves the
+  // original angular speeds exactly.
+  late final Ticker _ticker;
+  final ValueNotifier<double> _clock = ValueNotifier<double>(0);
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 2600),
-    )..repeat();
+    _ticker = createTicker((elapsed) {
+      _clock.value = elapsed.inMicroseconds / Duration.microsecondsPerSecond;
+    })..start();
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _ticker.dispose();
+    _clock.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 390,
-      height: 390,
+      width: widget.size,
+      height: widget.size,
       child: RepaintBoundary(
         child: AnimatedBuilder(
-          animation: _controller,
+          animation: _clock,
           builder: (_, __) => CustomPaint(
             painter: _OrbPainter(
-              t: _controller.value,
+              t: _clock.value,
               state: widget.state,
               level: widget.level.clamp(0.0, 1.0).toDouble(),
             ),
@@ -70,7 +82,9 @@ class _OrbPainter extends CustomPainter {
     required this.level,
   });
 
-  double get phase => t * math.pi * 2;
+  // t is CONTINUOUS seconds (never wraps), so phase keeps growing forever and
+  // the /2.6 keeps the same angular speed the old 2600 ms cycle had.
+  double get phase => t * math.pi * 2 / 2.6;
 
   @override
   void paint(Canvas canvas, Size size) {

@@ -17,6 +17,39 @@ APP_ALIASES={
 }
 WEB_ALIASES={"گوگل":"https://www.google.com","google":"https://www.google.com","یوتیوب":"https://www.youtube.com","youtube":"https://www.youtube.com","جیمیل":"https://mail.google.com","gmail":"https://mail.google.com","چت جی پی تی":"https://chatgpt.com","chatgpt":"https://chatgpt.com"}
 MEDIA_WORDS=("آهنگ","موزیک","موسیقی","فیلم","پلیر","پخش","مدیا","ویدیو","song","music","movie","player","media","track","video","vlc","spotify")
+# Words that can be captured as a "topic" by the loose research patterns but never
+# are one. Matched against the whole extracted topic, never a substring.
+_NON_TOPICS={
+    "ادامه","ادامه‌ش","بگو","بده","دوباره","همین","باشه","خوب","بعد","بعدش","سپس","لطفا","لطفاً","تکرار",
+    "continue","go on","more","again","please","next","repeat","resume","it","this","that",
+}
+# A topic that is just a generic object reference («فایل رو بررسی کن» -> «فایل»)
+# is never a research subject; it used to send «فایل رو بررسی کن» to Wikipedia's
+# article about files. An explicit wrapper («درباره فایل تحقیق کن») still counts,
+# so asking about the CONCEPT keeps working.
+_GENERIC_TOPIC=re.compile(
+    r"(?:(?:این|همین|اون|آن|that|this|the)\s+)?"
+    r"(?:(?:فایل|فایلی|پوشه|زیپ|پروژه|پروژه‌ها|عکس|تصویر|سند|متن|کد|پیوست|ضمیمه|اسکرین\s*شات)(?:ش|اش|ها|های)?"
+    r"|(?:file|folder|zip|project|image|picture|code|screenshot|attachment)s?)"
+    r"(?:\s+(?:پیوست|ضمیمه|زیپ|پیست))?$",
+    re.I,
+)
+# A topic built around a demonstrative reference to the user's own object
+# («داخل این زیپ چی هست؟ خلاصه» — the trailing «بگو» action used to smuggle the
+# whole phrase into research) always points at something in the conversation
+# (an uploaded attachment), never at a web subject. Unlike _GENERIC_TOPIC this
+# holds even WITH a research wrapper: «درباره این زیپ تحقیق کن» still refers to
+# THE zip in the chat. The bare concept («درباره فایل تحقیق کن») keeps working.
+_ATTACH_REFERENCE=re.compile(
+    r"(?:این|همین|اون|آن|that|this)\s+"
+    r"(?:فایل|فایلی|پوشه|زیپ|پروژه|عکس|تصویر|سند|متن|کد|پیوست|ضمیمه|اسکرین\s*شات"
+    r"|file|folder|zip|project|image|picture|code|screenshot|attachment)s?",
+    re.I,
+)
+# «صدا را کم کن» states a direction but no magnitude. Only an imperative gets the
+# default step, so a declarative «صدای من کم است» still falls through to chat.
+_VOLUME_STEP=10.0
+_IMPERATIVE=re.compile(r"(?:\bکن\b|\bکنش\b|\bبده\b|\bببر\b|\bبیار\b|\bبگذار\b|\bبکش\b|\bلطفا\b|\bplease\b|\bturn\s+(?:it\s+)?(?:up|down)\b|\bmake\s+it\b)",re.I)
 
 
 def _fa(text:str,language:str|None=None)->bool:
@@ -45,7 +78,7 @@ def _multi(actions:list[dict[str,Any]],is_fa:bool,fa:str,en:str)->dict[str,Any]:
 def _media(tool:str,is_fa:bool,fa:str,en:str)->dict[str,Any]: return _plan(tool,{},is_fa,fa,en)
 
 def _extract_query(text:str)->str|None:
-    m=re.search(r"(?:سرچ\s*کن|جستجو\s*کن|جست‌وجو\s*کن|search(?:\s+for)?|look\s+up|google\s+for)\s+(.+)",text,re.I)
+    m=re.search(r"(?:سرچ\s*کن|جست\s*و?\s*جو\s*کن|search(?:\s+for)?|look\s+up|google\s+for)\s+(.+)",text,re.I)
     if not m:return None
     q=m.group(1).strip()
     q=re.sub(r"\s+(?:و|and)\s+(?:صفحه\s+)?(?:ویکی\s*پدیا|ویکیپدیا)(?:ش)?(?:\s+(?:را|رو))?(?:\s+باز(?:ش)?\s+کن)?\b.*$","",q,flags=re.I)
@@ -70,9 +103,11 @@ def quote_component(value:str)->str:
 def _is_player(text:str)->bool: return any(x in text.lower() for x in MEDIA_WORDS)
 
 def _change(text:str)->tuple[bool,bool]:
-    low=text.lower(); return bool(re.search(r"(?:زیاد|بالا|ببر|بیشتر|up|increase|louder|turn\s+up|raise|higher)",low)), bool(re.search(r"(?:کم|پایین|بیاور|کمتر|down|decrease|quieter|turn\s+down|lower)",low))
+    # «صدا را بلند کن» / «آرومش کن» are the most natural Persian phrasings; without
+    # بلند and آروم the sentence carries no direction at all and no volume plan fires.
+    low=text.lower(); return bool(re.search(r"(?:زیاد|بالا|بلند|ببر|بیشتر|افزایش|(?<!\w)up(?!\w)|increase|louder|turn\s+up|raise|higher|boost)",low)), bool(re.search(r"(?:کم|پایین|آروم|آهسته|ساکت|بیاور|کمتر|(?<!\w)down(?!\w)|decrease|quieter|turn\s+down|lower|reduce)",low))
 
-def _is_abs(text:str)->bool: return bool(re.search(r"(?:روی|رو|بذار|بگذار|تنظیم\s*کن|set|to|روی\s*مقدار|at)\s*[۰-۹0-9]+\s*(?:درصد|%|percent)?",text,re.I))
+def _is_abs(text:str)->bool: return bool(re.search(r"(?:روی|رو|به|بذار|بگذار|برسان|برسون|تنظیم\s*کن|set|to|at)\s*[۰-۹0-9]+\s*(?:درصد|%|percent)?",text,re.I))
 
 def _play_query(text:str)->str|None:
     value=re.sub(r"\s+", " ", text.strip())
@@ -177,13 +212,23 @@ def _research_query(text: str) -> str | None:
     hit = re.sub(r"\s+(?:را|رو|اش|ش)$", "", hit, flags=re.I).strip()
     hit = re.sub(r"\s+(?:میخوام|می‌خوام|میخواهم|می‌خواهم)$", "", hit, flags=re.I).strip()
     hit = hit.replace(" یک", " 1").replace(" اول", " 1")
-    return hit.strip(" ،,؟?!.:؛\"'") or None
+    hit = hit.strip(" ،,؟?!.:؛\"'")
+    # The bare «بده»/«بگو» action alternation also matches continuation words, so
+    # «ادامه بده» used to be researched as the topic «ادامه». Only an exact match
+    # is rejected — «ادامه جنگ جهانی دوم رو بررسی کن» still extracts its topic.
+    if hit.lower() in _NON_TOPICS:
+        return None
+    if _ATTACH_REFERENCE.search(hit):
+        return None
+    if _GENERIC_TOPIC.fullmatch(hit) and not re.search(wrapper, value, re.I):
+        return None
+    return hit or None
 
 
 def _generic_web_query(text: str) -> str | None:
     low = text.lower().strip()
     patterns = [
-        r"^(?:برو\s+)?(?:جستجو|جست‌وجو|سرچ)\s+(?:کن\s+)?(?:برای\s+)?(.+)$",
+        r"^(?:برو\s+)?(?:جست\s*و?\s*جو|سرچ)\s+(?:کن\s+)?(?:برای\s+)?(.+)$",
         r"^(?:برو\s+)?(?:پیدا\s+کن|پیداش\s+کن)\s+(.+)$",
         r"^(?:search|google|look up|find)\s+(?:for\s+)?(.+)$",
     ]
@@ -227,14 +272,196 @@ def _weather(text:str)->tuple[bool,str|None,bool]:
 
 def _path_for_phrase(text:str)->str|None:
     low=text.lower()
-    if "دسکتاپ" in low or "desktop" in low:return "desktop"
+    if "دسکتاپ" in low or "desktop" in low or "صفحه اصلی" in low or "home screen" in low:return "desktop"
     if "دانلود" in low or "download" in low:return "downloads"
     if re.search(r"(?:درایو\s*سی|drive\s*c|c:)",low):return "C:/"
     return None
 
+_NAME_HEAD=re.compile(r"^(?:(?:با|به)\s*(?:اسم|نام)|(?:اسم(?:ش|شو|شون)?|نام(?:ش)?|named|called)\s*(?:را|رو)?)\s*[:\-]?\s*",re.I)
+_NAME_TAIL=re.compile(r"(?:\s*(?:رو|را))?\s*(?:ب(?:ذار|زار|گذار|گزار)|بساز(?:ش)?|بزن|بده|کن)\s*$",re.I)
+# «... در پوشه دانلودها بساز» states WHERE, not the name.
+_NAME_LOC=re.compile(r"\s+(?:در|توی|تو|داخل|روی|on|inside|in)\s+(?:پوشه|فولدر|folder|دسکتاپ|desktop|دانلود(?:ها)?|downloads|اسناد|documents|درایو|drive|صفحه\s*اصلی).*$",re.I)
+
+def _clean_name_reply(text:str)->str:
+    """«با اسم تست» / «اسمش رو بذار تست» -> «تست»; trailing verbs are trimmed too."""
+    value=str(text or "").strip().strip('"\'«»')
+    value=_NAME_HEAD.sub("",value).strip()
+    value=re.sub(r"^(?:ب(?:ذار|زار|گذار|گزار)|بساز|بزن)\s+","",value,flags=re.I).strip()
+    value=_NAME_TAIL.sub("",value).strip()
+    value=_NAME_LOC.sub("",value).strip()
+    value=_NAME_TAIL.sub("",value).strip()
+    return value.strip('"\'«»').strip()
+
 def _folder_name_for_create(text:str)->str|None:
-    m=re.search(r"(?:به\s*اسم|با\s*اسم|به\s*نام|با\s*نام|اسم(?:ش)?\s*(?:را|رو)?\s*)\s*[\"']?(.+?)[\"']?$",text,re.I)
-    return m.group(1).strip() if m else None
+    m=re.search(r"(?:به\s*اسم|با\s*اسم|به\s*نام|با\s*نام|اسم(?:ش|شو)?\s*(?:را|رو)?\s*|named|called)\s*[\"']?(.+?)[\"']?$",text,re.I)
+    if not m:return None
+    name=_clean_name_reply(m.group(1))
+    return name or None
+
+_CREATE_VERB=re.compile(r"(?:بساز(?:ش|شون|ی|ید)?|ایجاد\s*کن|درست\s*کن|create|make)",re.I)
+_OPEN_VERB=re.compile(r"(?:باز\s*(?:ش\s*)?کن|بازش\s*کن|بازش|open|اجرا\s*کن|بخون(?:ش|شون)?|بخوان|read|launch)",re.I)
+_FOLDER_WORD=re.compile(r"(?:پوشه|فولدر|folder)",re.I)
+_FILE_WORD=re.compile(r"(?:فایل|file)",re.I)
+_CHATGPT_WORD=re.compile(r"(?:چت\s*جی\s*پی\s*تی|chatgpt|chat\s*gpt|openai)",re.I)
+_SPLIT_CONNECT=re.compile(r"\s+(?:و بعد|بعدش|بعد|سپس|و|and|then|after that)\s+|[،;]",re.I)
+
+def _split_clauses(text:str)->list[str]:
+    return [p.strip(" ،,؛;.") for p in _SPLIT_CONNECT.split(str(text or "")) if p.strip()]
+
+def _split_ext_word(name:str)->tuple[str,str]:
+    """«تست با پسوند پایتونی» -> («تست», «py»); no extension word -> (name, «»)."""
+    m=re.match(r"^(.*?)\s+(?:با|به)\s+(?:پسوند|فرمت|extension|format)\s+(\S+)\s*$",name or "",re.I)
+    if m and m.group(1).strip():
+        return m.group(1).strip(),system_tools.resolve_extension(m.group(2))
+    return name or "",""
+
+def _file_name_and_ext(text:str)->tuple[str,str]:
+    """«با اسم تست با پسوند پایتونی» / «فایل تست.py بساز» -> («تست», «py»)."""
+    value=str(text or "").strip()
+    m=re.search(r"(?:به\s*اسم|با\s*اسم|به\s*نام|با\s*نام|اسم(?:ش|شو)?\s*(?:را|رو)?\s*|named|called)\s*[\"']?(.+?)[\"']?$",value,re.I)
+    if m:
+        name=_clean_name_reply(m.group(1))
+    else:
+        m2=re.search(r"(?:فایل|file)\s+[\"'«]?([^\"'»]+?)[\"'»]?\s+(?:رو\s+|را\s+)?(?:بساز(?:ش)?|ایجاد\s*کن|درست\s*کن|create|make)",value,re.I)
+        name=_clean_name_reply(m2.group(1)) if m2 else ""
+    name=name.strip("،,؛;.: ").strip()
+    if not name:return "",""
+    name,ext=_split_ext_word(name)
+    name=name.strip("،,؛;.: ").strip()
+    if not name:return "",""
+    if "." in name:
+        head,_,tail=name.rpartition(".")
+        if head and re.fullmatch(r"[A-Za-z0-9]{1,8}",tail):
+            return head,(tail.lower() if not ext else ext)
+    return name,ext
+
+def _folder_clause_name(text:str)->str:
+    name=_folder_name_for_create(text)
+    if not name:
+        m=re.search(r"(?:پوشه|فولدر|folder)\s+[\"'«]?([^\"'»]+?)[\"'»]?\s+(?:رو\s+|را\s+)?(?:بساز(?:ش)?|ایجاد\s*کن|درست\s*کن|create|make)",text,re.I)
+        if m:
+            candidate=_clean_name_reply(m.group(1))
+            if candidate and candidate.lower() not in {"توش","داخلش","داخل","اون","آن","جدید","خالی","بساز"}:
+                name=candidate
+    name,_ext=_split_ext_word(name or "")
+    return (name or "").strip("،,؛;.: ").strip()
+
+def _compound_create_plan(text:str,is_fa:bool)->dict[str,Any]|None:
+    """«پوشه بساز + فایل توش بساز + بازش کن» as one dependent chain.
+
+    The generic splitter has no data flow, so it would join «تست با پسوند
+    پایتونی» into a single wrong file name; this detector runs before it.
+    """
+    low=text.lower()
+    if not (_FOLDER_WORD.search(low) and _FILE_WORD.search(low) and _CREATE_VERB.search(low)):return None
+    parts=_split_clauses(text)
+    if not (2<=len(parts)<=8):return None
+    base=_path_for_phrase(text) or "desktop"
+    folder_name="";file_name="";ext="";open_after=False
+    for part in parts:
+        if _FOLDER_WORD.search(part) and _CREATE_VERB.search(part) and not folder_name:
+            folder_name=_folder_clause_name(part)
+        elif _FILE_WORD.search(part) and _CREATE_VERB.search(part) and not file_name:
+            file_name,ext=_file_name_and_ext(part)
+        if _OPEN_VERB.search(part):open_after=True
+    if not folder_name or not file_name:return None
+    args={"base":base,"folder":folder_name,"file":file_name,"ext":ext,"open_after":open_after,"language":"fa" if is_fa else "en"}
+    fa=f"پوشهٔ «{folder_name}» و فایل «{file_name}» را می‌سازم"+(f" و بازش می‌کنم." if open_after else ".")
+    en=f"I'll create the folder '{folder_name}' with the file '{file_name}'"+(" and open it." if open_after else ".")
+    return _plan("create_project",args,is_fa,fa,en)
+
+_SEARCH_JO=r"جست\s*و?\s*جو"
+
+def _search_read_plan(text:str,is_fa:bool)->dict[str,Any]|None:
+    """«برو تو گوگل X رو جستجو کن، اولین سایت رو باز کن و بخونش» as one command."""
+    low=text.lower()
+    if re.search(r"(?:ویکی\s*پدیا|ویکیپدیا|wikipedia)",low,re.I):return None
+    if not re.search(rf"(?:گوگل|google|{_SEARCH_JO}|search|سرچ|look\s*up)",low,re.I):return None
+    reads=bool(re.search(r"(?:بخون|بخوان|بخونش|مطالعه|read)",low,re.I))
+    # «صفحه اولش» / «سایت اول» / «اولین نتیجه» qualify; a bare «سایت چت جی پی تی»
+    # (opening a site) must NOT, or the ChatGPT detector never gets a chance.
+    opens_first=bool(_OPEN_VERB.search(low) and re.search(r"(?:صفحه|سایت|نتیجه|result|page|link)\s+(?:اول|اولین|اولش|first|top)|(?:اولین|first|top)\s+(?:صفحه|سایت|نتیجه|result|page|link)",low,re.I))
+    if not (reads or opens_first):return None
+    body=re.sub(r"^\s*(?:لطفا|لطفاً|please)?\s*(?:برو|go|بزن|ورود|وارد\s*شو)\s*(?:تو|در|داخل|به|to|into)?\s*(?:گوگل|google)\s*","",text,flags=re.I).strip()
+    if not body:return None
+    verb=rf"(?:{_SEARCH_JO}|سرچ|search(?:\s+for)?|look\s*up)"
+    topic=""
+    # «X رو (در گوگل) جستجو کن» first: for «تام هاردی رو جستجو کن و بعد اولین
+    # سایت رو باز کن...» the verb-then-topic form would otherwise capture the
+    # whole trailing chain as the query.
+    m0=re.search(rf"(.+?)\s+(?:را|رو)\s*(?:در\s+|تو\s+|توی\s+|in\s+|on\s+)?(?:گوگل\s+|google\s+)?{verb}",body,re.I)
+    if m0:
+        topic=m0.group(1)
+    else:
+        m=re.search(rf"{verb}\s*(?:کن|کنش|بزن|بکن)?\s+(.+)",body,re.I)
+        if m:
+            topic=m.group(1)
+        else:
+            m2=re.search(r"(?:صفحه|سایت|نتیجه|first\s+result|top\s+result)\s+(?:اول(?:ین)?(?:ش)?\s+)?(.+?)\s+(?:را|رو)\s*(?:باز\s*(?:ش\s*)?کن|open)",body,re.I)
+            if m2:topic=m2.group(1)
+    if not topic:return None
+    topic=re.split(r"\s+(?:و\s+)?(?:بعد(?:ش)?|سپس|then|after\s+that)\s+",topic,maxsplit=1,flags=re.I)[0]
+    topic=re.split(r"\s+و\s+(?=(?:صفحه|سایت|نتیجه|اولین|اول|first|top|open|باز|بخون|بخوان|read))",topic,maxsplit=1,flags=re.I)[0]
+    topic=re.sub(r"^(?:و|and)\s+","",topic,flags=re.I)
+    topic=re.sub(r"^(?:برای|for)\s+","",topic,flags=re.I)
+    topic=re.sub(r"\s+(?:صفحه|سایت|نتیجه|اولین|اول|first|top)\b.*$","",topic,flags=re.I)
+    topic=re.sub(r"\s+(?:را|رو)(?:\s+باز(?:\s*(?:ش\s*)?کن)?)?\s*$","",topic,flags=re.I).strip()
+    topic=re.sub(r"\s+(?:باز(?:\s*(?:ش\s*)?کن)?|بخون(?:ش|شون)?|بخوان|read(?:\s+it)?|open(?:\s+it)?)\s*$","",topic,flags=re.I).strip()
+    topic=re.sub(r"\s+(?:یا|or)\s+(?:هر\s*چی(?:زی)?|هرچی|چیزی|anything|whatever|something)(?:\s+دیگر(?:ی)?)?\s*$","",topic,flags=re.I).strip()
+    topic=re.sub(r"\s+(?:برام|برایم|برای\s+من|for\s+me)\s*$","",topic,flags=re.I).strip()
+    topic=topic.strip(" ،,؛;.:؟?!").strip()
+    if not topic or topic.lower() in _NON_TOPICS or len(topic)<2:return None
+    if re.search(rf"(?:{_SEARCH_JO}|سرچ|search|باز\s*(?:ش\s*)?کن|بخون|بخوان|\bopen\b|\bread\b|\blook\s*up\b)",topic,re.I):return None
+    fa=f"«{topic}» را در گوگل جست‌وجو می‌کنم، اولین نتیجه را باز می‌کنم و می‌خوانم."
+    en=f"I'll search Google for {topic}, open the first result and read it."
+    return _plan("search_open_read",{"query":topic,"language":"fa" if is_fa else "en"},is_fa,fa,en)
+
+def _chatgpt_write_plan(text:str,is_fa:bool)->dict[str,Any]|None:
+    """«سایت چت جی پی تی رو باز کن و یک چت جدید بنویس...» -> open + ask what to write."""
+    low=text.lower()
+    if not _CHATGPT_WORD.search(low):return None
+    if not re.search(r"(?:بنویس|بنویسم|بنویسش|بفرست|تایپ|write|type|send)",low,re.I):return None
+    if not re.search(r"(?:باز\s*(?:ش\s*)?کن|بازش\s*کن|open|برو|go|وارد\s*شو|ورود)",low,re.I):return None
+    fa="چت جی پی تی را باز می‌کنم. چی بنویسم براش؟"
+    en="Opening ChatGPT. What should I write for it?"
+    return _plan("open_chatgpt_chat",{"language":"fa" if is_fa else "en"},is_fa,fa,en)
+
+_CODE_NOUN=re.compile(r"(?:کد(?:\s*نویسی)?|\bcode\b|اسکریپت|script|برنامه(?:\s*نویسی)?|program|application|\bapp\b|اپلیکیشن|\bاپ\b|بازی|\bgame\b|ماشین\s*حساب|calculator|وب\s*سایت|وبسایت|website|\bsite\b|سایت|صفحه\s*وب|\bweb\s*page\b|پروژه|\bproject\b|تابع|function|کلاس|\bclass\b|الگوریتم|algorithm|\bbot\b|ربات)",re.I)
+# «سایت» تنها برای گاردهای «باز کن» و «با اسم» کافی نیست؛ بقیهٔ کلمات محکم‌اند.
+_CODE_CORE=re.compile(r"(?:کد(?:\s*نویسی)?|\bcode\b|اسکریپت|script|برنامه(?:\s*نویسی)?|program|application|\bapp\b|اپلیکیشن|\bاپ\b|بازی|\bgame\b|ماشین\s*حساب|calculator|وب\s*سایت|وبسایت|website|\bsite\b|صفحه\s*وب|\bweb\s*page\b|پروژه|\bproject\b|تابع|function|کلاس|\bclass\b|الگوریتم|algorithm|\bbot\b|ربات)",re.I)
+_CODE_LANG=re.compile(r"(?:پایتون(?![ییها])|python|جاوا\s*اسکریپت|جاوااسکریپت|javascript|\bjs\b|تایپ\s*اسکریپت|typescript|جاوا|\bjava\b|c\+\+|cpp|سی\s*شارپ|c#|csharp|php|ruby|swift|kotlin|rust|\bgo\b|html|css|sql|bash|پاور\s*شل|powershell)",re.I)
+_CODE_VERB=re.compile(r"(?:بنویس(?!ی?م)|بساز(?!ی?م)|بزن(?!ی?م)|بکن(?!ی?م)|درست\s*کن(?!ی?م)|کد\s*بزن(?!ی?م)|کد\s*نویسی\s*کن(?!ی?م)|پیاده\s*سازی\s*کن(?!ی?م)|\b(?:write|writing|create|creating|make|making|build|building|code|coding|generate|generating|develop|implement)\b)",re.I)
+_TEXT_ARTIFACT=re.compile(r"(?:متن|مقاله|شعر|داستان|نامه|پیام|ایمیل|کپشن|توضیح|مطلب|مطلبی|پاراگراف|انشا|\btext\b|\barticle\b|\bpoem\b|\bstory\b|\bletter\b|\bmessage\b|\bemail\b|\bcaption\b|\bparagraph\b|\bessay\b)",re.I)
+
+def _code_write_plan(text:str,is_fa:bool)->dict[str,Any]|None:
+    """«یک برنامه/بازی/اسکریپت (به هر زبانی) بنویس و اگر خواست زیپ تحویل بده»."""
+    value=str(text or "").strip()
+    low=value.lower()
+    if _CHATGPT_WORD.search(low):return None
+    if not _CODE_VERB.search(low):return None
+    has_core=bool(_CODE_CORE.search(low))
+    has_noun=has_core or bool(re.search(r"(?:سایت|\bsite\b)",low,re.I))
+    has_lang=bool(_CODE_LANG.search(low))
+    if not (has_noun or has_lang):return None
+    # «یک متن/مقاله/شعر دربارهٔ پایتون بنویس» نوشتار است، نه تولید کد.
+    if _TEXT_ARTIFACT.search(low) and not has_core:return None
+    # «توش/داخلش بنویس X» تایپ داخل یک صفحه است، نه تولید کد.
+    if re.search(r"(?:توش|داخلش|داخل|\bin\s+it\b|\bthere\b)\s*(?:بنویس|بنویسه|تایپ|type|write)",low,re.I):return None
+    # «... را باز کن و بعد بنویس/بساز» ناوبری+تایپ است؛ نام کد (core) لازم است.
+    if not has_core and re.search(r"(?:باز\s*(?:ش\s*)?کن|بازش\s*کن|\bopen\b|برو|\bgo\b|وارد\s*شو)[\s\S]{0,60}?(?:بنویس|بساز|تایپ|write|type|create|make)",low,re.I):return None
+    # «فایل/پوشه با اسم/پسوند X بساز» ساختِ همان فایل/پوشه است، نه نوشتن برنامه؛
+    # نامی که کاربر می‌گوید («پروژه»، «script.py») نباید با نامِ کد اشتباه شود.
+    if (_FILE_WORD.search(low) or _FOLDER_WORD.search(low)) and re.search(r"(?:با\s*اسم|به\s*اسم|با\s*نام|به\s*نام|با\s*پسوند|با\s*فرمت|named|called)",low):return None
+    # فعل و نام/زبان باید نزدیک هم باشند (پنجرهٔ ۴۵ نویسه‌ای، هر ترتیبی).
+    noun_lang=rf"(?:{_CODE_NOUN.pattern}|{_CODE_LANG.pattern})"
+    verb=_CODE_VERB.pattern
+    near=re.search(rf"{noun_lang}[\s\S]{{0,45}}?{verb}",low,re.I) or re.search(rf"{verb}[\s\S]{{0,45}}?{noun_lang}",low,re.I)
+    if not near:return None
+    zip_flag=bool(re.search(r"(?:زیپ|\bzip\b)",low,re.I))
+    base=_path_for_phrase(value) or "desktop"
+    fa="دارم کد را می‌نویسم و فایل‌های پروژه را می‌سازم؛ کمی طول می‌کشد."+((" فایل زیپ را هم کنارش تحویل می‌دهم.") if zip_flag else "")
+    en="I'm writing the code and creating the project files; this may take a moment."+((" I'll deliver a ZIP file with it.") if zip_flag else "")
+    return _plan("write_code",{"spec":value,"base":base,"zip":zip_flag,"language":"fa" if is_fa else "en"},is_fa,fa,en)
 
 def _greeting(text:str)->bool:
     low=text.lower().strip()
@@ -242,8 +469,18 @@ def _greeting(text:str)->bool:
     en_hit=bool(re.search(r"(?:^|\s)(?:hello|hi|hey)(?:$|\s|[!,?.])",low)) or any(x in low for x in ("how are you","what's up"))
     return (fa_hit or en_hit) and len(low)<80
 
-def _affirm(text:str)->bool: return text.strip().lower() in {"بله","آره","اره","تایید","تأیید","تایید میکنم","تأیید می‌کنم","حتما","حتماً","باشه","ادامه بده","بخون","کاملش کن","بیشتر بگو","yes","yeah","yep","sure","okay","ok","confirm","confirmed","continue","read it","tell me more"}
-def _negative(text:str)->bool: return text.strip().lower() in {"نه","نخیر","نمیخوام","نمی‌خوام","بیخیال","کافیه","بس است","no","nope","stop","enough"}
+_YES_BASE=r"(?:بله|آره|اره|حتما|حتماً|باشه|اوکی|تایید|تأیید|درسته|yes|yeah|yep|sure|ok|okay)"
+_CONTINUE_VERB=r"(?:بخون|بخوان|ادامه(?:\s+بده)?|بیشتر\s+بگو|کاملش\s+کن|کامل\s+کن|read\s+(?:it|more)|continue|tell\s+me\s+more)"
+
+def _affirm(text:str)->bool:
+    value=re.sub(r"[.!؟?،,؛;]+$","",text.strip().lower()).strip()
+    value=re.sub(r"^(?:لطفا|لطفاً|خواهشا|خواهشاً|please)\s+","",value).strip()
+    value=re.sub(r"\s+(?:لطفا|لطفاً|خواهشا|خواهشاً|please)$","",value).strip()
+    if value in {"بله","آره","اره","تایید","تأیید","تایید میکنم","تأیید می‌کنم","حتما","حتماً","باشه","ادامه بده","بخون","کاملش کن","بیشتر بگو","yes","yeah","yep","sure","okay","ok","confirm","confirmed","continue","read it","tell me more"}:
+        return True
+    # Compound forms like «آره لطفا»، «بله بخون»، «اره انجامش بده».
+    return bool(re.fullmatch(rf"{_YES_BASE}(?:\s+(?:انجام(?:ش)?|تأیید(?:ش)?|تایید(?:ش)?|بده|بکن|کن|کنش|{_CONTINUE_VERB})){{0,2}}", value, re.I))
+def _negative(text:str)->bool: return text.strip().lower() in {"نه","نخیر","لغو","کنسل","cancel","نمیخوام","نمی‌خوام","بیخیال","بی خیال","کافیه","بس است","بسه","ولش کن","منصرف شدم","نکن","no","nope","stop","enough"}
 
 
 def fast_plan(text:str,language:str|None=None,include_conversation:bool=True,include_knowledge:bool=True)->dict[str,Any]|None:
@@ -257,6 +494,39 @@ def fast_plan(text:str,language:str|None=None,include_conversation:bool=True,inc
     value=normalize_command_text(text); low=value.lower().strip(); is_fa=_fa(value,language)
     if not value:return None
 
+    if _affirm(value):
+        if system_tools.wikipedia_more_available(): return _plan("wikipedia_more",{},is_fa,"ادامهٔ مطلب را می‌خوانم.","I'll continue reading the article.")
+    # «نه»/«لغو» answers whatever Smartis is waiting for: the reading flow, a
+    # file-name question, a folder-name question. All of them are dropped.
+    if _negative(value) and system_tools.clear_all_pendings(): return {"ok":True,"plan":{"reply":"باشه، منتظرم برای دستور بعدی." if is_fa else "Okay, I'm ready for your next command.","actions":[],"needs_confirmation":False},"provider":"conversation"}
+
+    # The answer to «چی بنویسم براش؟» is free text for the open chat box, not a
+    # new command — consume it before ANY detector (even greetings, since the
+    # user may well want to write «سلام» into the chat) can reinterpret it.
+    if system_tools.has_pending_prompt():
+        system_tools.take_pending_prompt()
+        return _plan("type_text",{"text":value.strip(),"language":"fa" if is_fa else "en"},is_fa,"دارم براش می‌نویسم و می‌فرستم.","Typing it in and sending now.")
+
+    # Composite «پوشه بساز + فایل توش بساز + بازش کن» as one dependent chain. It
+    # must outrank the conversational heuristics («سلام» inside the sentence) and
+    # the code-writing detector (a folder/file created WITH A NAME is a file-system
+    # command, not codegen), and must run before the generic splitter: the splitter
+    # has no data flow and would invent a wrong file name.
+    compound_create=_compound_create_plan(value,is_fa)
+    if compound_create:return compound_create
+
+    # Code writing: «یک برنامه/بازی/اسکریپت بنویس (و زیپش کن)». A high-precision
+    # command detector, so it outranks the fuzzy conversational heuristics below:
+    # «...که سلام بده» / "prints hello world" / «...تو کی هستی رو بپرسه» inside the
+    # spec must not be answered as greeting/introduction. It also must run before
+    # search_read/search_chain/splitter (search_read would hijack «بنویس که گوگل
+    # رو باز کنه...»، chain's «...بده» tail would hijack «...که سلام بده»، and the
+    # splitter would truncate the spec). _CHATGPT_WORD and typing guards inside the
+    # detector keep the chatgpt/Windows-search sentences intact; the file-word
+    # guard keeps «پوشه/فایل با اسم X بساز» for compound/single-file detectors.
+    code_write=_code_write_plan(value,is_fa)
+    if code_write:return code_write
+
     if not include_conversation:
         pass
     elif _greeting(value): return {"ok":True,"plan":{"reply":greeting("fa" if is_fa else "en"),"actions":[],"needs_confirmation":False},"provider":"conversation"}
@@ -267,19 +537,23 @@ def fast_plan(text:str,language:str|None=None,include_conversation:bool=True,inc
     if include_conversation and any(p in low for p in ("چه کارهایی بلدی","چه کارایی بلدی","قابلیت هات چیه","چه کار میکنی","what can you do")):
         return {"ok":True,"plan":{"reply":capabilities("fa" if is_fa else "en"),"actions":[],"needs_confirmation":False},"provider":"conversation"}
 
-    if _affirm(value):
-        if system_tools.wikipedia_more_available(): return _plan("wikipedia_more",{},is_fa,"ادامهٔ مطلب را می‌خوانم.","I'll continue reading the article.")
-    if _negative(value) and system_tools.wikipedia_clear_pending(): return {"ok":True,"plan":{"reply":"باشه، منتظرم برای دستور بعدی." if is_fa else "Okay, I'm ready for your next command.","actions":[],"needs_confirmation":False},"provider":"conversation"}
+    # «برو تو گوگل X رو جستجو کن، اولین سایت رو باز کن و بخونش».
+    search_read=_search_read_plan(value,is_fa)
+    if search_read:return search_read
+
+    # «سایت چت جی پی تی رو باز کن و یک چت جدید بنویس...».
+    chatgpt_write=_chatgpt_write_plan(value,is_fa)
+    if chatgpt_write:return chatgpt_write
 
     # Windows Search: accept many natural forms, including "باز کن توش بنویس X".
-    if re.search(r"(?:سرچ|جست(?:جو|‌وجو)|search).{0,18}(?:ویندوز|سیستم|windows|system)", value, re.I):
-        qm=re.search(r"(?:توش|داخلش|داخل|in it|there)\s*(?:بنویس|بنویسه|جستجو\s+کن|سرچ\s+کن|search|type)\s+(.+)$", value, re.I)
+    if re.search(r"(?:سرچ|جست\s*و?\s*جو|search).{0,18}(?:ویندوز|سیستم|windows|system)", value, re.I):
+        qm=re.search(r"(?:توش|داخلش|داخل|in it|there)\s*(?:بنویس|بنویسه|جست\s*و?\s*جو\s+کن|سرچ\s+کن|search|type)\s+(.+)$", value, re.I)
         if not qm:
             qm=re.search(r"(?:برای|for)\s+(.+)$", value, re.I)
         query=(qm.group(1).strip(" ،,؟?!.") if qm else "")
         return _plan("windows_system_search",{"query":query},is_fa,"جست‌وجوی ویندوز را باز می‌کنم." if not query else f"جست‌وجوی ویندوز را باز می‌کنم و «{query}» را جست‌وجو می‌کنم.","Opening Windows Search." if not query else f"Opening Windows Search and searching for {query}.")
 
-    # Search/navigation chains first so only the requested topic is searched.
+    # Search/navigation chains so only the requested topic is searched.
     chain=_search_chain(value,is_fa)
     if chain:return chain
 
@@ -323,17 +597,27 @@ def fast_plan(text:str,language:str|None=None,include_conversation:bool=True,inc
 
     if any(x in low for x in ("تنظیمات سیستم","تنظیمات ویندوز","windows settings","system settings","settings")): return _plan("open_windows_settings",{},is_fa,"تنظیمات ویندوز را باز می‌کنم.","Opening Windows Settings.")
 
-    # Files and folders.
+    # Files and folders. The verb may come before or after the name
+    # («فایل بساز با اسم تست» / «یه فایل با اسم تست.py بساز» / «بساز یک فایل»).
     base=_path_for_phrase(value)
-    if re.search(r"(?:فایل|file)\s+(?:بساز|ایجاد\s*کن|create|make)",low):
-        m=re.search(r"(?:به\s*اسم|با\s*اسم|به\s*نام|با\s*نام|اسم(?:ش)?\s*(?:را|رو)?\s*)\s*[\"']?(.+?)[\"']?$",value,re.I)
-        if m:
-            name=m.group(1).strip(); base=base or "desktop"
-            return _plan("create_file",{"path":str(PathSafeJoin(base,name))},is_fa,"فایل ساخته شد.","The file has been created.")
+    if re.search(r"(?:فایل|file)[^\n]{0,45}?(?:بساز|بسازش|ایجاد\s*کن|create|make)|(?:بساز|ایجاد\s*کن|create|make)\s+(?:یک\s+|یه\s+)?(?:فایل|file)",low):
+        name,ext=_file_name_and_ext(value)
+        if name.lower() in {"توش","داخلش","داخل","اون","آن","جدید","خالی"}:
+            name="";ext=""
+        if name:
+            base=base or "desktop"
+            full=f"{name}.{ext}" if ext else name
+            return _plan("create_file",{"path":str(PathSafeJoin(base,full))},is_fa,"فایل ساخته شد.","The file has been created.")
         system_tools.set_pending_file(base or "desktop")
         return {"ok":True,"plan":{"reply":"اسم فایل رو چی بزارم؟","actions":[],"needs_confirmation":False},"provider":"conversation"}
-    if re.search(r"(?:پوشه|folder)\s+(?:بساز|ایجاد\s*کن|create|make)",low):
+    if re.search(r"(?:پوشه|folder)[^\n]{0,45}?(?:بساز|ایجاد\s*کن|create|make)|(?:بساز|ایجاد\s*کن|create|make)\s+(?:یک\s+|یه\s+)?(?:پوشه|folder)",low):
         name=_folder_name_for_create(value)
+        if not name:
+            m2=re.search(r"(?:پوشه|folder)\s+[\"'«]?([^\"'»]+?)[\"'»]?\s+(?:رو\s+|را\s+)?(?:بساز|ایجاد\s*کن|create|make)",value,re.I)
+            if m2:
+                candidate=_clean_name_reply(m2.group(1))
+                if candidate and candidate.lower() not in {"توش","داخلش","داخل","اون","آن","جدید","خالی"}:
+                    name=candidate
         if name:
             base=base or "desktop"; return _plan("create_folder",{"path":str(PathSafeJoin(base,name))},is_fa,"پوشه ساخته شد.","The folder has been created.")
         system_tools.set_pending_folder(base or "desktop")
@@ -355,26 +639,29 @@ def fast_plan(text:str,language:str|None=None,include_conversation:bool=True,inc
     if any(x in low for x in ("ادامه پخش","resume","continue playback","ادامه بده")) and _is_player(low): return _media("media_play_pause",is_fa,"پخش را ادامه دادم.","Resuming playback.")
 
     player=_is_player(low); inc,dec=_change(low); n=_num(value)
+    step=abs(n) if n is not None else (_VOLUME_STEP if _IMPERATIVE.search(low) else None)
     if player and any(x in low for x in ("بی صدا","بی‌صدا","قطع صدا","mute")):
         return _plan("player_mute",{"enabled":True},is_fa,"صدای پخش‌کننده را قطع کردم.","Muted the active player.")
     if player and any(x in low for x in ("وصل صدا","صدا رو وصل","صدا را وصل","آهنگ رو وصل","آهنگ را وصل","وصل کن","unmute","از حالت بی صدا دربیار")):
         return _plan("player_mute",{"enabled":False},is_fa,"صدای پخش‌کننده را وصل کردم.","Unmuted the active player.")
-    if player and any(x in low for x in ("صدای آهنگ","صدای موزیک","صدای فیلم","صدای پلیر","player volume","music volume","movie volume")):
+    if player and any(x in low for x in ("صدای آهنگ","صدای موزیک","صدای فیلم","صدای پلیر","ولوم","volume","player volume","music volume","movie volume")):
         if any(x in low for x in ("قطع صدا","بی صدا","بی‌صدا","mute")): return _plan("player_mute",{"enabled":True},is_fa,"صدای پخش‌کننده را قطع کردم.","Muted the active player.")
         if any(x in low for x in ("وصل صدا","صدا رو وصل","صدا را وصل","آهنگ رو وصل","آهنگ را وصل","وصل کن","unmute","از حالت بی صدا دربیار")): return _plan("player_mute",{"enabled":False},is_fa,"صدای پخش‌کننده را وصل کردم.","Unmuted the active player.")
         if any(x in low for x in ("تا آخر","تا اخر","maximum","max","full")): return _plan("player_volume_max",{},is_fa,"صدای پخش‌کننده را تا بیشترین مقدار قابل پشتیبانی می‌برم.","I'll set the player to its maximum supported volume.")
         if n is not None and not inc and not dec and ("%" in value or "درصد" in low or _is_abs(value)): return _plan("player_volume_set",{"percent":n},is_fa,f"صدای پخش‌کننده را روی {n:.0f} درصد می‌گذارم.",f"Setting player volume to {n:.0f}%.")
-        if n is not None and inc:return _plan("player_volume_change",{"delta":abs(n)},is_fa,f"صدای پخش‌کننده را {abs(n):.0f} درصد زیاد می‌کنم.",f"Increasing player volume by {abs(n):.0f}%.")
-        if n is not None and dec:return _plan("player_volume_change",{"delta":-abs(n)},is_fa,f"صدای پخش‌کننده را {abs(n):.0f} درصد کم می‌کنم.",f"Decreasing player volume by {abs(n):.0f}%.")
+        if step is not None and inc:return _plan("player_volume_change",{"delta":step},is_fa,f"صدای پخش‌کننده را {step:.0f} درصد زیاد می‌کنم.",f"Increasing player volume by {step:.0f}%.")
+        if step is not None and dec:return _plan("player_volume_change",{"delta":-step},is_fa,f"صدای پخش‌کننده را {step:.0f} درصد کم می‌کنم.",f"Decreasing player volume by {step:.0f}%.")
 
-    # System audio — plain "صدا 10 درصد" is absolute.
-    if not player and any(x in low for x in ("صدا","volume","بلندی صدا","میزان صدا")):
+    # System audio — plain "صدا 10 درصد" is absolute. «ولوم» must be listed here:
+    # without it the block is skipped and _simple_math below swallows the sentence
+    # («ولوم را به ۲۰ درصد برسان» -> calculate) because it contains a number + «درصد».
+    if not player and any(x in low for x in ("صدا","ولوم","volume","بلندی صدا","میزان صدا")):
         if any(x in low for x in ("قطع صدا","صدا رو قطع","صدا را قطع","بی صدا","بی‌صدا","mute","سایلنت")): return _plan("system_mute",{"enabled":True},is_fa,"صدای سیستم را قطع کردم.","Muted system audio.")
         if any(x in low for x in ("وصل صدا","صدا رو وصل","صدا را وصل","آهنگ رو وصل","آهنگ را وصل","وصل کن","unmute","از حالت بی صدا دربیار")): return _plan("system_mute",{"enabled":False},is_fa,"صدای سیستم را وصل کردم.","Unmuted system audio.")
         if any(x in low for x in ("تا آخر","maximum","max","full")): return _plan("system_volume_set",{"percent":100},is_fa,"صدای سیستم را روی 100 درصد گذاشتم.","Set system volume to 100%.")
-        if n is not None and not inc and not dec and ("%" in value or "درصد" in low or _is_abs(value) or re.fullmatch(r"صدا\s*[۰-۹0-9]+",low)): return _plan("system_volume_set",{"percent":n},is_fa,f"صدای سیستم روی {n:.0f} درصد تنظیم شد.",f"Setting system volume to {n:.0f}%.")
-        if n is not None and inc:return _plan("system_volume_change",{"delta":abs(n)},is_fa,f"صدای سیستم را {abs(n):.0f} درصد زیاد می‌کنم.",f"Increasing system volume by {abs(n):.0f}%.")
-        if n is not None and dec:return _plan("system_volume_change",{"delta":-abs(n)},is_fa,f"صدای سیستم را {abs(n):.0f} درصد کم می‌کنم.",f"Decreasing system volume by {abs(n):.0f}%.")
+        if n is not None and not inc and not dec and ("%" in value or "درصد" in low or _is_abs(value) or re.fullmatch(r"(?:صدا|ولوم)\s*[۰-۹0-9]+",low)): return _plan("system_volume_set",{"percent":n},is_fa,f"صدای سیستم روی {n:.0f} درصد تنظیم شد.",f"Setting system volume to {n:.0f}%.")
+        if step is not None and inc:return _plan("system_volume_change",{"delta":step},is_fa,f"صدای سیستم را {step:.0f} درصد زیاد می‌کنم.",f"Increasing system volume by {step:.0f}%.")
+        if step is not None and dec:return _plan("system_volume_change",{"delta":-step},is_fa,f"صدای سیستم را {step:.0f} درصد کم می‌کنم.",f"Decreasing system volume by {step:.0f}%.")
 
     # Power. Only SHORT imperative sentences count; "how do I restart my router?"
     # or "I could not sleep" are conversation, not a power command.
@@ -418,6 +705,12 @@ def fast_plan(text:str,language:str|None=None,include_conversation:bool=True,inc
         if m:
             name=m.group(1).strip(" \"'،,")
             return _plan("open_named",{"name":name,"kind":"file"},is_fa,"فایل را پیدا می‌کنم و باز می‌کنم.","I'll find and open the file.")
+    # A bare file name WITH an extension is enough: «تست.py رو باز کن» / "open notes.txt".
+    # Executables stay applications and fall through to the APP_ALIASES block below.
+    ext_m=re.search(r"(?<![\w.])([\w\u0600-\u06FF\-]+\.(?:py|pyw|ipynb|txt|md|json|csv|js|ts|jsx|tsx|html?|css|java|cpp|cc|c|h|cs|php|rb|go|rs|sql|sh|bat|ps1|cmd|docx?|xlsx?|pptx?|pdf|rtf|log|xml|ya?ml|ini|cfg|png|jpe?g|gif|bmp|svg|mp3|wav|mp4|mkv|avi|zip|rar|7z|tar|gz))(?![\w])",value,re.I)
+    if ext_m and re.search(r"(?:باز\s*(?:کن|ش کن)|بخوان|بخون|open|launch|read)",low,re.I):
+        if ext_m.group(1).rsplit(".",1)[-1].lower() not in {"exe","com","msi","lnk"}:
+            return _plan("open_named",{"name":ext_m.group(1),"kind":"file"},is_fa,"فایل را پیدا می‌کنم و باز می‌کنم.","I'll find and open the file.")
 
     # Navigation/open commands.
     open_words=("باز کن","بازش کن","اجرا کن","راه‌اندازی کن","راه اندازی کن","بیار","open","launch","start","go to","برو تو","برو به","وارد شو","برو داخل")
@@ -438,12 +731,22 @@ def fast_plan(text:str,language:str|None=None,include_conversation:bool=True,inc
     # If the previous turn asked for a file name, consume the next otherwise-unknown utterance.
     if system_tools.has_pending_file() and not _negative(value) and not low.startswith(("لغو","cancel")):
         pending=system_tools.take_pending_file()
-        return _plan("create_file",{"path":str(PathSafeJoin(pending["base"],value.strip('" ')))},is_fa,"فایل ساخته شد.","The file has been created.")
+        name,ext_word=_split_ext_word(_clean_name_reply(value))
+        if ext_word and name and "." not in name:
+            name=f"{name}.{ext_word}"
+        if not name:
+            system_tools.set_pending_file(pending["base"])
+            return {"ok":True,"plan":{"reply":"اسم فایل رو چی بزارم؟","actions":[],"needs_confirmation":False},"provider":"conversation"}
+        return _plan("create_file",{"path":str(PathSafeJoin(pending["base"],name))},is_fa,"فایل ساخته شد.","The file has been created.")
 
     # If the previous turn asked for a folder name, consume the next otherwise-unknown utterance.
     if system_tools.has_pending_folder() and not _negative(value) and not low.startswith(("لغو","cancel")):
         pending=system_tools.take_pending_folder()
-        return _plan("create_folder",{"path":str(PathSafeJoin(pending["base"],value.strip('" ')))},is_fa,"پوشه ساخته شد.","The folder has been created.")
+        name=_clean_name_reply(value)
+        if not name:
+            system_tools.set_pending_folder(pending["base"])
+            return {"ok":True,"plan":{"reply":"اسم پوشه رو چی بزارم؟","actions":[],"needs_confirmation":False},"provider":"conversation"}
+        return _plan("create_folder",{"path":str(PathSafeJoin(pending["base"],name))},is_fa,"پوشه ساخته شد.","The folder has been created.")
 
     return None
 

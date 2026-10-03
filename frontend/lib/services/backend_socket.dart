@@ -144,21 +144,51 @@ class BackendSocket {
   }
 
   /// Typed-chat endpoint. Always returns a human-style reply, never a dead end.
+  /// [attachmentIds] are ids returned by [uploadFiles]; the backend injects
+  /// their inspected content into the model context for this request.
   Future<Map<String, dynamic>> chat(
     String text,
     String? language,
     String requestId, {
     bool thinking = false,
+    List<String> attachmentIds = const [],
   }) async {
     return _json(
       await http
           .post(
             Uri.parse('$baseUrl/chat'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'text': text, 'language': language, 'request_id': requestId, 'thinking': thinking}),
+            body: jsonEncode({
+              'text': text,
+              'language': language,
+              'request_id': requestId,
+              'thinking': thinking,
+              if (attachmentIds.isNotEmpty) 'attachments': attachmentIds,
+            }),
           )
-          .timeout(const Duration(minutes: 6)),
+          // Thinking mode can legally run CHAT_TIMEOUT * 1.6 = 384 s on the
+          // local model, so the HTTP cut-off must sit above that.
+          .timeout(const Duration(minutes: 10)),
     );
+  }
+
+  /// Uploads local files (a ZIP included) for the chat attachment store.
+  /// The backend inspects each file - ZIPs get their full tree extracted -
+  /// and returns one descriptor per file: {ok, id, name, kind, size_label, ...}.
+  Future<Map<String, dynamic>> uploadFiles(
+    List<String> paths, {
+    String? language,
+  }) async {
+    final request = http.MultipartRequest('POST', Uri.parse('$baseUrl/chat/upload'));
+    if (language != null && language.isNotEmpty) {
+      request.fields['language'] = language;
+    }
+    for (final path in paths) {
+      request.files.add(await http.MultipartFile.fromPath('files', path));
+    }
+    final streamed = await request.send().timeout(const Duration(minutes: 3));
+    final response = await http.Response.fromStream(streamed);
+    return _json(response);
   }
 
   Future<Map<String, dynamic>> cancelChat(String requestId) async {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,7 @@ class SherpaService:
         self.fa_error: Optional[str] = None
         self.en_error: Optional[str] = None
         self.status = "not_loaded"
+        self.warm_ms: dict[str, float] = {}
 
     def load(self) -> None:
         if sherpa_onnx is None:
@@ -85,6 +87,31 @@ class SherpaService:
             )
 
         self.status = "ready" if self.ready else "error"
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        """Run one throwaway decode per recognizer.
+
+        ONNX builds its execution graph lazily, so without this the user's very
+        first spoken command pays the whole session-initialisation cost on top
+        of the decode itself.
+        """
+        if not self.ready:
+            return
+        probe = np.zeros(int(self.TARGET_SAMPLE_RATE * 0.35), dtype=np.float32)
+        probe[::97] = 0.0015
+        warm_ms: dict[str, float] = {}
+        for name, recognizer in (("fa", self.fa_recognizer), ("en", self.en_recognizer)):
+            if recognizer is None:
+                continue
+            started = time.perf_counter()
+            try:
+                with self.lock:
+                    self._decode(recognizer, probe, self.TARGET_SAMPLE_RATE)
+            except Exception:  # pragma: no cover - model/runtime dependent
+                continue
+            warm_ms[name] = round((time.perf_counter() - started) * 1000)
+        self.warm_ms = warm_ms
 
     @property
     def ready(self) -> bool:
@@ -138,26 +165,32 @@ class SherpaService:
 
     @staticmethod
     def _trim_silence(samples: np.ndarray, sample_rate: int) -> np.ndarray:
-        """Remove only long leading/trailing silence so CTC decode is faster."""
+        """Remove only long leading/trailing silence so CTC decode is faster.
+
+        The activity threshold is derived from the quietest 10% of frames of
+        this very recording instead of a fixed -48 dB, because an AGC-boosted
+        Windows microphone often sits above -48 dB and would then never be
+        trimmed at all. Frame statistics are computed with one vectorised pass.
+        """
         values = np.asarray(samples, dtype=np.float32).reshape(-1)
         if values.size < max(1, int(sample_rate * 0.10)):
             return values
         frame = max(160, int(sample_rate * 0.02))
-        threshold = 10 ** (-48.0 / 20.0)
-        active: list[tuple[int, int]] = []
-        for start in range(0, values.size, frame):
-            chunk = values[start:start + frame]
-            if chunk.size == 0:
-                continue
-            rms = float(np.sqrt(np.mean(np.square(chunk))))
-            peak = float(np.max(np.abs(chunk)))
-            if rms >= threshold or peak >= threshold * 1.8:
-                active.append((start, min(values.size, start + frame)))
-        if not active:
+        n_frames = values.size // frame
+        if n_frames == 0:
+            return values
+        frames = values[: n_frames * frame].reshape(n_frames, frame)
+        magnitudes = np.abs(frames)
+        rms_db = 20.0 * np.log10(np.maximum(np.sqrt(np.mean(frames * frames, axis=1)), 1e-9))
+        peak_db = 20.0 * np.log10(np.maximum(magnitudes.max(axis=1), 1e-9))
+        noise_db = float(np.percentile(rms_db, 10))
+        threshold_db = float(np.clip(noise_db + 9.0, -72.0, -30.0))
+        active = np.flatnonzero((rms_db >= threshold_db) | (peak_db >= threshold_db + 5.1))
+        if active.size == 0:
             return values
         pad = int(sample_rate * 0.06)
-        left = max(0, active[0][0] - pad)
-        right = min(values.size, active[-1][1] + pad)
+        left = max(0, int(active[0]) * frame - pad)
+        right = min(values.size, (int(active[-1]) + 1) * frame + pad)
         return values[left:right]
 
     @classmethod
@@ -210,13 +243,18 @@ class SherpaService:
 
         samples = self._trim_silence(samples, int(sample_rate))
 
+        decode_ms: dict[str, float] = {}
         if language_hint == "fa" and self.fa_recognizer is not None:
+            started = time.perf_counter()
             with self.lock:
                 text = self._decode(self.fa_recognizer, samples, int(sample_rate))
+            decode_ms["fa"] = round((time.perf_counter() - started) * 1000)
             language = "fa" if text else None
         elif language_hint == "en" and self.en_recognizer is not None:
+            started = time.perf_counter()
             with self.lock:
                 text = self._decode(self.en_recognizer, samples, int(sample_rate))
+            decode_ms["en"] = round((time.perf_counter() - started) * 1000)
             language = "en" if text else None
         else:
             # Persian is the primary language. Decode Persian first so normal
@@ -225,21 +263,25 @@ class SherpaService:
             fa_text = ""
             en_text = ""
             if self.fa_recognizer is not None:
+                started = time.perf_counter()
                 with self.lock:
                     try:
                         fa_text = self._decode(self.fa_recognizer, samples, int(sample_rate))
                     except Exception:
                         fa_text = ""
+                decode_ms["fa"] = round((time.perf_counter() - started) * 1000)
 
             if fa_text and self._looks_persian(fa_text):
                 language, text = "fa", fa_text
             else:
                 if self.en_recognizer is not None:
+                    started = time.perf_counter()
                     with self.lock:
                         try:
                             en_text = self._decode(self.en_recognizer, samples, int(sample_rate))
                         except Exception:
                             en_text = ""
+                    decode_ms["en"] = round((time.perf_counter() - started) * 1000)
                 if en_text and self._looks_english(en_text):
                     language, text = "en", en_text
                 elif fa_text:
@@ -261,6 +303,8 @@ class SherpaService:
             "provider": "sherpa-onnx",
             "error": None if text else "Empty result.",
             "levels": levels,
+            "decode_ms": decode_ms,
+            "audio_seconds": round(samples.size / float(max(1, int(sample_rate))), 2),
         }
 
     def transcribe_file(
@@ -304,4 +348,6 @@ class SherpaService:
             "fa_ready": self.fa_recognizer is not None,
             "en_ready": self.en_recognizer is not None,
             "sherpa_status": self.status,
+            "num_threads": SHERPA_NUM_THREADS,
+            "warm_ms": dict(self.warm_ms),
         }
